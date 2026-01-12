@@ -1,0 +1,20 @@
+[tool.poetry]
+name = "bedrockhelper"
+version = "0.1.0"
+description = ""
+authors = ["Matthew Marion <matthew@mmarion.dev>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.13"
+pytest = "^9.0.2"
+boto3 = "^1.42.25"
+
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^9.0.2"
+pytest-cov = "^7.0.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
