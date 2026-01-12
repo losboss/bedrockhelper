@@ -162,7 +162,11 @@ class _BotoSessionManager:
 		with self._lock:
 			sess = self._ensure_session()
 			if service_name not in self._clients:
-				self._clients[service_name] = sess.client(service_name, config=self._cfg)
+				self._clients[service_name] = sess.client(
+					service_name,
+					region_name=self._region,
+					config=self._cfg,
+				)
 			return self._clients[service_name]
 
 
