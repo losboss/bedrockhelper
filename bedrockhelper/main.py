@@ -19,7 +19,7 @@ Note:
 """
 
 from __future__ import annotations
-
+import time
 import asyncio
 import json
 import logging
@@ -793,7 +793,6 @@ class BedrockHelper:
 			poll_seconds: float = 10.0,
 			timeout_seconds: float = 3600.0,
 	) -> dict:
-		import time
 
 		deadline = time.time() + timeout_seconds
 		while True:

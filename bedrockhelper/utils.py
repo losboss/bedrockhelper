@@ -20,33 +20,7 @@ def iter_bedrock_stream_text(
 	"""
 	Iterate a Bedrock streaming event stream and call `on_text(...)` for each text delta.
 
-	Supports two Bedrock streaming shapes:
-	  1) invoke_model_with_response_stream (Anthropic-style event JSON in chunk['bytes'])
-		 - event: {"chunk": {"bytes": b"...json..."}}
-		 - message delta: msg["delta"]["text"]
-		 - stop: msg["type"] in invoke_stop_types
-
-	  2) converse_stream (Bedrock Converse event dicts)
-		 - event often contains: {"contentBlockDelta": {"delta": {"text": "..."}}}
-		   (some SDKs may snake_case: "content_block_delta")
-		 - stop events may include keys in converse_stop_keys set to truthy
-		 - some events may include {"messageStop": {...}} (dict), or {"messageStop": True}
-
-	Parameters
-	----------
-	event_stream:
-		Iterable of events from the streaming call.
-	on_text:
-		Callback invoked for each text chunk/delta.
-	stream_kind:
-		"auto" (default), "invoke", or "converse".
-		- auto: detect per-event; works even if a stream has occasional odd events.
-	invoke_stop_types:
-		Stop values for msg["type"] in invoke streams.
-	converse_stop_keys:
-		Keys that indicate stop in converse streams.
-	decode:
-		Byte decoding used for invoke streams.
+	(docstring trimmed for brevity)
 	"""
 
 	def _handle_invoke_event(event: dict) -> bool:
@@ -76,7 +50,6 @@ def iter_bedrock_stream_text(
 
 	def _handle_converse_event(event: dict) -> bool:
 		# Returns True if should stop
-		# text delta: event["contentBlockDelta"]["delta"]["text"] (or snake_case variant)
 		cbd = event.get("contentBlockDelta") or event.get("content_block_delta")
 		if isinstance(cbd, dict):
 			delta = cbd.get("delta")
@@ -85,13 +58,10 @@ def iter_bedrock_stream_text(
 				if isinstance(t, str) and t:
 					on_text(t)
 
-		# stop signals can appear as presence/truthiness of known keys
 		for k in converse_stop_keys:
 			if k in event and event.get(k):
 				return True
 
-		# Some shapes embed stop under a dict
-		# e.g. {"messageStop": {"stopReason": "..."}}
 		ms = event.get("messageStop") or event.get("message_stop")
 		if isinstance(ms, dict) and ms:
 			return True
@@ -102,25 +72,46 @@ def iter_bedrock_stream_text(
 		if not isinstance(event_item, dict):
 			continue
 
-		if stream_kind == "invoke":
-			if _handle_invoke_event(event_item):
-				break
-			continue
+		kind = stream_kind
 
-		if stream_kind == "converse":
-			if _handle_converse_event(event_item):
-				break
-			continue
+		if kind == "auto":
+			# Prefer converse when a converse-like shape or stop key is present.
+			has_converse = False
+			if (
+					"contentBlockDelta" in event_item
+					or "content_block_delta" in event_item
+					or "messageStop" in event_item
+					or "message_stop" in event_item
+			):
+				has_converse = True
+			else:
+				for k in converse_stop_keys:
+					if k in event_item and event_item.get(k):
+						has_converse = True
+						break
 
-		# auto-detect: prefer converse shape if it looks like converse
-		if "contentBlockDelta" in event_item or "content_block_delta" in event_item:
-			if _handle_converse_event(event_item):
-				break
-			continue
+			if has_converse:
+				should_stop = _handle_converse_event(event_item)
+				if should_stop:
+					break
+				# Do not also treat the same event as an invoke event.
+				continue
 
-		# otherwise try invoke shape (it will no-op if no "chunk")
-		if _handle_invoke_event(event_item):
-			break
+			# If no converse signal, but a chunk is present, treat as invoke.
+			if "chunk" in event_item:
+				kind = "invoke"
+			else:
+				# nothing recognizable in auto mode; skip
+				continue
+
+		if kind == "invoke":
+			should_stop = _handle_invoke_event(event_item)
+			if should_stop:
+				break
+		else:  # explicit "converse"
+			should_stop = _handle_converse_event(event_item)
+			if should_stop:
+				break
 
 
 def normalize_headers(headers: Mapping[str | int, Any]) -> Dict[str, Any]:

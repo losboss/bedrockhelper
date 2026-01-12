@@ -1,5 +1,6 @@
 from unittest import TestCase
 
+from bedrockhelper.batch.models import BatchJobRef
 from bedrockhelper.models import BatchJobResponse
 
 
@@ -50,3 +51,24 @@ class TestBatchJobResponse(TestCase):
 			BatchJobResponse.summary({"status": None}),
 			"Unknown",
 		)
+
+
+class TestBatchJobRefConversion(TestCase):
+	def test_to_ref_returns_equivalent_batch_job_ref(self):
+		resp = BatchJobResponse(
+			job_id="job-123",
+			job_name="job-name",
+			model_id="my-model",
+			input_s3_uri="s3://input",
+			output_s3_uri="s3://output",
+			response={"status": "Completed"},
+		)
+
+		ref = resp.to_ref()
+
+		self.assertIsInstance(ref, BatchJobRef)
+		self.assertEqual(ref.job_id, "job-123")
+		self.assertEqual(ref.job_name, "job-name")
+		self.assertEqual(ref.model_id, "my-model")
+		self.assertEqual(ref.input_s3_uri, "s3://input")
+		self.assertEqual(ref.output_s3_uri, "s3://output")

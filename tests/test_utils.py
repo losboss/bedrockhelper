@@ -64,6 +64,44 @@ class TestIterBedrockStreamText(TestCase):
 		iter_bedrock_stream_text(events, on_text=lambda t: collected.append(t), stream_kind="invoke")
 		self.assertEqual(collected, ["ok"])
 
+	def test_invoke_skips_falsy_chunk_and_processes_following_invoke_event(self):
+		events = [
+			{"chunk": {}},  # falsy chunk should be ignored
+			{"chunk": {"bytes": json.dumps({"delta": {"text": "ok"}, "type": "end"}).encode("utf-8")}},
+		]
+		collected = []
+		iter_bedrock_stream_text(events, on_text=lambda t: collected.append(t), stream_kind="invoke")
+		self.assertEqual(collected, ["ok"])
+
+	def test_invoke_skips_empty_bytes_and_processes_following_invoke_event(self):
+		events = [
+			{"chunk": {"bytes": b""}},  # empty bytes should be ignored
+			{"chunk": {"bytes": json.dumps({"delta": {"text": "ok"}, "type": "end"}).encode("utf-8")}},
+		]
+		collected = []
+		iter_bedrock_stream_text(events, on_text=lambda t: collected.append(t), stream_kind="invoke")
+		self.assertEqual(collected, ["ok"])
+
+	def test_converse_stops_on_message_stop_snake_case_dict(self):
+		events = [
+			{"contentBlockDelta": {"delta": {"text": "a"}}},
+			{"message_stop": {"stopReason": "done"}},  # snake_case dict stop should trigger branch
+			{"contentBlockDelta": {"delta": {"text": "ignored"}}},
+		]
+		collected = []
+		iter_bedrock_stream_text(events, on_text=lambda t: collected.append(t), stream_kind="converse")
+		self.assertEqual(collected, ["a"])
+
+	def test_auto_prefers_converse_and_stops_on_converse_stop(self):
+		events = [
+			{"contentBlockDelta": {"delta": {"text": "conv"}}},
+			{"messageStop": {"stopReason": "done"},
+			 "chunk": {"bytes": json.dumps({"delta": {"text": "invoke"}, "type": "end"}).encode("utf-8")}},
+			{"chunk": {"bytes": json.dumps({"delta": {"text": "ignored"}, "type": "end"}).encode("utf-8")}},
+		]
+		collected = []
+		iter_bedrock_stream_text(events, on_text=lambda t: collected.append(t), stream_kind="auto")
+		self.assertEqual(collected, ["conv"])
 
 class TestNormalizeHeaders(TestCase):
 	def test_lowercases_keys(self):
