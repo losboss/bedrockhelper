@@ -1,7 +1,7 @@
 from unittest import TestCase
 
 from bedrockhelper.batch.models import BatchJobRef
-from bedrockhelper.models import BatchJobResponse
+from bedrockhelper import BatchJobResponse
 
 
 class TestBatchJobResponse(TestCase):

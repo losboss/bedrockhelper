@@ -11,6 +11,31 @@ A small, batteries-included helper for Amazon Bedrock:
 
 ---
 
+## Structure
+``` plaintext
+├── .github
+│      └── workflows
+│          └── mypy.yml
+├── .gitignore
+├── poetry.lock
+├── pyproject.toml
+├── README.md
+├── src
+│    └── bedrockhelper
+│          ├── __init__.py
+│          ├── batch
+│          ├── main.py
+│          ├── models.py
+│          ├── types.py
+│          └── utils.py
+└── tests
+    ├── test_batch_models.py
+    ├── test_batch_store.py
+    ├── test_main.py
+    ├── test_models.py
+    ├── test_reconcile.py
+    └── test_utils.py
+```
 ## Installation
 
 This module is intended to be vendored or installed directly from source.
@@ -26,12 +51,12 @@ Requirements:
 ## Quick Start
 
 ```python
-from bedrockhelper.main import BedrockHelper
+from bedrockhelper import BedrockHelper
 
 helper = BedrockHelper(
-    region_name="ca-central-1",
-    rag_model_id="global.anthropic.claude-sonnet-4-5-20250929-v1:0",
-    embedding_model_id="amazon.titan-embed-text-v2:0",
+	region_name="ca-central-1",
+	rag_model_id="global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+	embedding_model_id="amazon.titan-embed-text-v2:0",
 )
 ```
 
@@ -139,19 +164,21 @@ embeddings = helper.parse_batch_embeddings(job.output_s3_uri)
 The helper includes a small framework for tracking and reconciling batch jobs.
 
 ```python
-from bedrockhelper.batch.store import InMemoryJobStore
+from bedrockhelper import InMemoryJobStore
 from bedrockhelper.batch.reconcile import reconcile_batch_embedding_jobs
 
 store = InMemoryJobStore()
 store.add(job)
 
+
 def process_embeddings(job, embeddings):
-    print("Processed", len(embeddings))
+	print("Processed", len(embeddings))
+
 
 reconcile_batch_embedding_jobs(
-    helper=helper,
-    store=store,
-    process_embeddings=process_embeddings,
+	helper=helper,
+	store=store,
+	process_embeddings=process_embeddings,
 )
 ```
 

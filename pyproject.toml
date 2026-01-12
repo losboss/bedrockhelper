@@ -1,20 +1,41 @@
 [tool.poetry]
 name = "bedrockhelper"
 version = "0.1.0"
-description = ""
+description = "Helper utilities for Amazon Bedrock (RAG, embeddings, batch jobs)"
 authors = ["Matthew Marion <matthew@mmarion.dev>"]
 readme = "README.md"
+license = "MIT"
+packages = [{ include = "bedrockhelper", from = "src" }]
+include = ["README.md", "LICENSE*"]
 
 [tool.poetry.dependencies]
-python = "^3.13"
-pytest = "^9.0.2"
+python = ">=3.10,<4.0"
 boto3 = "^1.42.25"
-
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^9.0.2"
 pytest-cov = "^7.0.0"
+mypy = "^1.14.0"
+ruff = "^0.9.0"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+exclude = [".venv", "dist", "build"]
+
+[tool.mypy]
+python_version = "3.10"
+mypy_path = ["src"]
+packages = ["bedrockhelper"]
+strict = true
+warn_unused_ignores = true
+warn_return_any = true
+no_implicit_optional = true
+exclude = "(^dist/|^build/|^\\.venv/)"
 
 [build-system]
-requires = ["poetry-core"]
+requires = ["poetry-core>=1.9.0"]
 build-backend = "poetry.core.masonry.api"

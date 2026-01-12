@@ -6,7 +6,7 @@ from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import MagicMock, patch
 
 from bedrockhelper import RAGResponse
-from bedrockhelper.main import BedrockHelper
+from bedrockhelper import BedrockHelper
 
 
 # -----------------------------

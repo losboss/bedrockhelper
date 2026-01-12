@@ -5,7 +5,7 @@ from datetime import datetime, timezone, timedelta
 from types import SimpleNamespace
 from typing import Any
 
-from bedrockhelper.batch.store import InMemoryJobStore
+from bedrockhelper import InMemoryJobStore
 
 
 @dataclass(frozen=True, slots=True)

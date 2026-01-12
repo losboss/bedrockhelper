@@ -147,7 +147,7 @@ class TestReconcileBatchEmbeddingJobs(unittest.TestCase):
 		called_kwargs = store.mark_checked.call_args.kwargs
 		self.assertIn("last_error", called_kwargs)
 		self.assertIn("boom", called_kwargs["last_error"])
-	
+
 
 	def test_reconcile_bedrock_status_none_skips_job(self):
 		helper = Mock()

@@ -1,12 +1,14 @@
 from unittest import TestCase
 import json
 
-from bedrockhelper.utils import (
+from bedrockhelper.main import (
 	iter_bedrock_stream_text,
 	normalize_records,
 	truncate_by_chars,
 	format_context_passages,
-	normalize_headers, extract_converse_text, build_converse_request
+	normalize_headers,
+	extract_converse_text,
+	build_converse_request
 )
 
 

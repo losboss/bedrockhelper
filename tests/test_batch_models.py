@@ -3,7 +3,7 @@ from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
 
 from bedrockhelper import BatchJobResponse
-from bedrockhelper.batch.models import StoredBatchJob
+from bedrockhelper.batch import StoredBatchJob
 
 
 class TestStoredBatchJob(unittest.TestCase):
