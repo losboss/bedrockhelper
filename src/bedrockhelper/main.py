@@ -134,7 +134,7 @@ class _BotoSessionManager:
 			extra_args['DurationSeconds'] = self._duration
 
 		fetcher = AssumeRoleCredentialFetcher(
-			client_creator=lambda service_name, region_name, **kwargs: sts,
+			client_creator=lambda service_name, region_name=self._sts_region, **kwargs: sts,
 			source_credentials=source_creds,
 			role_arn=self._role_arn,
 			extra_args=extra_args,
