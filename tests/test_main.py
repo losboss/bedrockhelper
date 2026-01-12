@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 from botocore.exceptions import ClientError
 
+from bedrockhelper import EmbeddingResponse
 from bedrockhelper.main import BedrockHelper, _BotoSessionManager, _is_expired_token
 
 
@@ -147,7 +148,7 @@ class TestBotoSessionManager(TestCase):
 		sess = mgr._build_boto3_session()
 		self.assertIs(sess, final_boto3_session)
 
-		# Confirm extra args assembled (covers those lines you flagged)
+		# Confirm extra args assembled
 		FetcherMock.assert_called_once()
 		kwargs = FetcherMock.call_args.kwargs
 		self.assertEqual(kwargs['source_credentials'], source_creds)
@@ -300,6 +301,33 @@ class TestBedrockHelperSync(TestCase):
 		self.assertEqual(BedrockHelper._extract_text_from_claude('hi'), 'hi')
 		self.assertEqual(BedrockHelper._extract_text_from_claude({'x': 1}), '')
 
+	def test_generate_with_claude_message_format_includes_extra_params(self):
+		bh = self._make_helper_with_clients()
+
+		# Capture the request body passed to invoke_model
+		captured = {}
+
+		def invoke_model(**kwargs):
+			captured['body'] = json.loads(kwargs['body'])
+			return {'body': BytesIO(json.dumps({'content': [{'text': 'ok'}]}).encode('utf-8'))}
+
+		bh.bedrock_runtime.invoke_model.side_effect = invoke_model
+
+		out = bh.generate_with_rag(
+			system_prompt='S',
+			context='CTX',
+			question='Q',
+			prefer_converse=False,  # force Claude fallback
+			stream=False,
+			top_p=0.9,  # <-- extra param (THIS triggers line 541)
+		)
+
+		self.assertEqual(out.text, 'ok')
+
+		# This assertion proves request_body.update(extra_params) executed
+		self.assertIn('top_p', captured['body'])
+		self.assertEqual(captured['body']['top_p'], 0.9)
+
 	def test_extract_metrics_body_usage_and_header_fallbacks(self):
 		bh = self._make_helper_with_clients()
 
@@ -355,6 +383,36 @@ class TestBedrockHelperSync(TestCase):
 		self.assertEqual(m.input_tokens, 123)
 		self.assertEqual(m.output_tokens, 7)
 		self.assertEqual(m.total_tokens, 130)  # computed from input+output if totalTokens missing
+
+	def test_extract_metrics_input_text_token_count_bad_value_is_ignored(self):
+		# No usable "usage" dict => metrics.input_tokens stays None so we hit the Titan path.
+		resp = {'ResponseMetadata': {'HTTPHeaders': {}}}
+		body = {
+			# This exists and is not None, but int("nope") raises ValueError -> except branch.
+			'inputTextTokenCount': 'nope'
+		}
+
+		m = BedrockHelper._extract_metrics_from_response(resp, body)
+
+		# Should remain None because conversion failed and was swallowed.
+		self.assertIsNone(m.input_tokens)
+
+	def test_extract_metrics_input_text_token_count_type_error_is_ignored(self):
+		resp = {'ResponseMetadata': {'HTTPHeaders': {}}}
+		body = {'inputTextTokenCount': object()}  # int(object()) -> TypeError
+
+		m = BedrockHelper._extract_metrics_from_response(resp, body)
+		self.assertIsNone(m.input_tokens)
+
+	@patch('bedrockhelper.main.normalize_headers', return_value={'x-amzn-bedrock-input-token-count': 'nope'})
+	def test_extract_metrics_header_get_int_bad_value_returns_none(self, norm_headers):
+		# HTTPHeaders just needs to be truthy to enter the header-metrics block
+		resp = {'ResponseMetadata': {'HTTPHeaders': {'X-Amzn-Bedrock-Input-Token-Count': 'nope'}}}
+
+		m = BedrockHelper._extract_metrics_from_response(resp, response_body=None)
+
+		# int("nope") raises ValueError => _get_int returns None (this hits the except branch)
+		self.assertIsNone(m.input_tokens)
 
 	def test_init_rejects_invalid_max_concurrent_streams(self):
 		with self.assertRaises(ValueError):
@@ -445,17 +503,19 @@ class TestBedrockHelperSync(TestCase):
 		bh.bedrock_runtime.converse.assert_called_once()
 
 	@patch('bedrockhelper.main.truncate_by_chars', side_effect=lambda s, n: s)
-	def test_generate_with_rag_converse_stream_missing_stream_falls_back(self, trunc):
+	@patch(
+		'bedrockhelper.main.iter_bedrock_stream_text',
+		side_effect=lambda stream, on_text, stream_kind: on_text('fallback'),
+	)
+	def test_generate_with_rag_converse_stream_missing_stream_falls_back(self, iter_stream, trunc):
 		bh = self._make_helper_with_clients()
 
-		# Converse stream returns {} -> _generate_with_converse_stream would raise,
-		# but generate_with_rag swallows and falls back to invoke_model path.
 		bh.bedrock_runtime.converse_stream.return_value = {}
 
-		# Mock the fallback invoke_model response
-		bh.bedrock_runtime.invoke_model.return_value = {
-			'body': BytesIO(json.dumps({'content': [{'text': 'fallback'}]}).encode('utf-8'))
-		}
+		# Make event_stream closable so the "hasattr(close)" branch is exercised.
+		event_stream = MagicMock()
+		event_stream.close = MagicMock()
+		bh.bedrock_runtime.invoke_model_with_response_stream.return_value = {'body': event_stream}
 
 		out = bh.generate_with_rag(
 			system_prompt='S',
@@ -466,7 +526,11 @@ class TestBedrockHelperSync(TestCase):
 		)
 
 		self.assertEqual(out.text, 'fallback')
-		bh.bedrock_runtime.invoke_model.assert_called_once()
+		self.assertTrue(out.stream)
+
+		bh.bedrock_runtime.invoke_model_with_response_stream.assert_called_once()
+		iter_stream.assert_called_once()
+		event_stream.close.assert_called_once()
 
 	def test__generate_with_converse_stream_missing_stream_raises(self):
 		bh = self._make_helper_with_clients()
@@ -658,6 +722,26 @@ class TestBedrockHelperSync(TestCase):
 		with self.assertRaises(TimeoutError):
 			bh.wait_for_batch_job('id', poll_seconds=0.0, timeout_seconds=0.0)
 
+	@patch('bedrockhelper.main.time.sleep', return_value=None)
+	@patch('bedrockhelper.main.time.time')
+	def test_wait_for_batch_job_times_out(self, time_time, sleep_mock):
+		bh = self._make_helper_with_clients()
+
+		# Never completes
+		bh.get_batch_job = MagicMock(return_value={'status': 'InProgress'})
+
+		# Simulate time moving:
+		# - First call: used to compute deadline (now=100) -> deadline = 100 + 1 = 101
+		# - Second call: inside loop check (now=100) -> not timed out, sleeps
+		# - Third call: next loop check (now=102) -> timed out -> raises (hits line 919)
+		time_time.side_effect = [100.0, 100.0, 102.0]
+
+		with self.assertRaises(TimeoutError) as ctx:
+			bh.wait_for_batch_job('job-1', poll_seconds=0.01, timeout_seconds=1.0)
+
+		self.assertIn('Batch job did not complete within 1.0s', str(ctx.exception))
+		sleep_mock.assert_called()  # proves we went through at least one non-terminal iteration
+
 	def test_download_batch_results_jsonl_invalid_uri(self):
 		bh = self._make_helper_with_clients()
 		with self.assertRaises(ValueError):
@@ -815,7 +899,7 @@ class TestBedrockHelperAsync(IsolatedAsyncioTestCase):
 	@patch('bedrockhelper.main.truncate_by_chars', side_effect=lambda s, n: s)
 	@patch('bedrockhelper.main.iter_bedrock_stream_text', side_effect=lambda stream, on_text, stream_kind: on_text('C'))
 	async def test_async_stream_generate_with_rag_release_exception_swallowed(self, iter_stream, trunc, ThreadMock):
-		# Covers the "release throws -> swallow" branch (your uncovered 898-899-ish style finally path)
+		# Covers the "release throws -> swallow" branch
 		bh = self._make_helper_with_clients()
 		bh._stream_sema = _ExplodingReleaseSema()
 
@@ -862,3 +946,163 @@ class TestBedrockHelperAsync(IsolatedAsyncioTestCase):
 			chunks.append(t)
 
 		self.assertEqual(chunks, ['OK'])
+
+	@patch(
+		'bedrockhelper.main.threading.Thread',
+		side_effect=lambda target, daemon: _ImmediateThread(target=target, daemon=daemon),
+	)
+	@patch('bedrockhelper.main.truncate_by_chars', side_effect=lambda s, n: f'TRUNC({s})')
+	@patch('bedrockhelper.main.format_context_passages', return_value='FORMATTED')
+	@patch(
+		'bedrockhelper.main.iter_bedrock_stream_text', side_effect=lambda stream, on_text, stream_kind: on_text('ok')
+	)
+	async def test_async_stream_normalize_context_value_sequence_calls_format_context_passages(
+		self,
+		iter_stream,
+		format_ctx,
+		trunc,
+		ThreadMock,
+	):
+		# runtime must support fallback streaming call
+		runtime = MagicMock(spec_set=['invoke_model_with_response_stream'])
+		runtime.invoke_model_with_response_stream.return_value = {'body': _FakeClosableStream()}
+
+		bh = BedrockHelper(
+			bedrock_runtime_client=runtime,
+			bedrock_client=MagicMock(),
+			s3_client=MagicMock(),
+		)
+
+		# context is Sequence[str] -> hits the ELSE branch in normalize_context_value()
+		ctx_list = ['a', 'b']
+
+		out = []
+		async for chunk in bh.async_stream_generate_with_rag(
+			system_prompt='S',
+			context=ctx_list,
+			include_headers_in_context=True,  # ensures arg is wired through
+			question='Q',
+			prefer_converse=False,  # go directly to fallback stream path
+			max_context_chars=123,
+		):
+			out.append(chunk)
+
+		self.assertEqual(out, ['ok'])
+
+		# These asserts prove line 651 else-branch executed
+		format_ctx.assert_called_once_with(list(ctx_list), include_headers=True)
+		trunc.assert_called_once_with('FORMATTED', 123)
+
+	@patch(
+		'bedrockhelper.main.threading.Thread',
+		side_effect=lambda target, daemon: _ImmediateThread(target=target, daemon=daemon),
+	)
+	@patch('bedrockhelper.main.truncate_by_chars', side_effect=lambda s, n: s)
+	@patch(
+		'bedrockhelper.main.iter_bedrock_stream_text', side_effect=lambda stream, on_text, stream_kind: on_text('ok')
+	)
+	async def test_async_stream_converse_stream_missing_stream_key_triggers_fallback(
+		self, iter_stream, trunc, ThreadMock
+	):
+		class RuntimeWithBadConverseStream:
+			# hasattr(..., "converse_stream") must be True, so define the method.
+			def converse_stream(self, **kwargs):
+				return {}  # missing "stream" => stream_obj is None => triggers line 696
+
+			def invoke_model_with_response_stream(self, **kwargs):
+				# fallback path used after the RuntimeError is caught
+				return {'body': _FakeClosableStream()}
+
+		runtime = RuntimeWithBadConverseStream()
+
+		bh = BedrockHelper(
+			bedrock_runtime_client=runtime,
+			bedrock_client=MagicMock(),
+			s3_client=MagicMock(),
+		)
+
+		chunks = []
+		async for t in bh.async_stream_generate_with_rag(
+			system_prompt='S',
+			context='CTX',
+			question='Q',
+			prefer_converse=True,  # force converse_stream attempt
+		):
+			chunks.append(t)
+
+		# If we successfully fell back, we should still get output
+		self.assertEqual(chunks, ['ok'])
+
+	@patch(
+		'bedrockhelper.main.threading.Thread',
+		side_effect=lambda target, daemon: _ImmediateThread(target=target, daemon=daemon),
+	)
+	@patch('bedrockhelper.main.truncate_by_chars', side_effect=lambda s, n: s)
+	@patch(
+		'bedrockhelper.main.iter_bedrock_stream_text',
+		side_effect=lambda stream, on_text, stream_kind: on_text('ok'),
+	)
+	async def test_async_stream_fallback_includes_extra_params_in_body(
+		self,
+		iter_stream,
+		trunc,
+		ThreadMock,
+	):
+		captured = {}
+
+		class RuntimeFallbackOnly:
+			# No converse_stream => fallback path
+			def invoke_model_with_response_stream(self, **kwargs):
+				captured['body'] = json.loads(kwargs['body'])
+				return {'body': _FakeClosableStream()}
+
+		bh = BedrockHelper(
+			bedrock_runtime_client=RuntimeFallbackOnly(),
+			bedrock_client=MagicMock(),
+			s3_client=MagicMock(),
+		)
+
+		out = []
+		async for chunk in bh.async_stream_generate_with_rag(
+			system_prompt='S',
+			context='CTX',
+			question='Q',
+			prefer_converse=True,  # doesn't matter; no converse_stream exists
+			top_p=0.42,  # <-- EXTRA PARAM (this hits line 723)
+		):
+			out.append(chunk)
+
+		self.assertEqual(out, ['ok'])
+
+		# This assertion proves body.update(extra_params) ran
+		self.assertIn('top_p', captured['body'])
+		self.assertEqual(captured['body']['top_p'], 0.42)
+
+	from unittest.mock import AsyncMock, MagicMock, patch
+
+	@patch('bedrockhelper.main.asyncio.to_thread', new_callable=AsyncMock)
+	async def test_async_embed_texts_uses_to_thread(self, to_thread):
+		bh = BedrockHelper(
+			bedrock_runtime_client=MagicMock(),
+			bedrock_client=MagicMock(),
+			s3_client=MagicMock(),
+		)
+
+		# Make to_thread execute the provided callable synchronously and return its value.
+		def _run_inline(fn, *args, **kwargs):
+			return fn(*args, **kwargs)
+
+		to_thread.side_effect = _run_inline
+
+		# Make embed_texts return a sentinel so we can assert it flowed through.
+		sentinel = EmbeddingResponse(embeddings={'a': [0.1]}, metrics={})
+		bh.embed_texts = MagicMock(return_value=sentinel)
+
+		out = await bh.async_embed_texts({'a': 'hello'})
+
+		self.assertIs(out, sentinel)
+		to_thread.assert_awaited_once()
+		# Ensure it was called to run bh.embed_texts with our args.
+		called_fn = to_thread.call_args.args[0]
+		self.assertIs(called_fn, bh.embed_texts)
+		self.assertEqual(to_thread.call_args.args[1:], ({'a': 'hello'},))
