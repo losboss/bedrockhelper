@@ -92,6 +92,80 @@ class TestIterBedrockStreamText(TestCase):
 		iter_bedrock_stream_text(events, on_text=lambda t: collected.append(t), stream_kind="converse")
 		self.assertEqual(collected, ["a"])
 
+	def test_invoke_skips_empty_or_nonstring_text_then_emits_later_and_stops(self):
+		"""
+		Covers invoke handler branch where delta.text is "" or not a str
+		(i.e. the guard `isinstance(t, str) and t` is False).
+		"""
+		events = [
+			# empty string -> should NOT emit
+			{"chunk": {"bytes": json.dumps({"delta": {"text": ""}}).encode("utf-8")}},
+			# non-string -> should NOT emit
+			{"chunk": {"bytes": json.dumps({"delta": {"text": 123}}).encode("utf-8")}},
+			# valid -> should emit + stop
+			{"chunk": {"bytes": json.dumps({"delta": {"text": "ok"}, "type": "end"}).encode("utf-8")}},
+			# would be ignored due to stop
+			{"chunk": {"bytes": json.dumps({"delta": {"text": "ignored"}}).encode("utf-8")}},
+		]
+
+		collected = []
+		iter_bedrock_stream_text(
+			events,
+			on_text=lambda t: collected.append(t),
+			stream_kind="invoke",
+			invoke_stop_types=("end",),  # make stop explicit
+		)
+		self.assertEqual(collected, ["ok"])
+
+	def test_converse_skips_empty_or_nonstring_text_and_stops_via_stop_key(self):
+		"""
+		Covers converse handler branch where delta.text is "" or not a str,
+		and covers stop-key loop by injecting a known stop key.
+		"""
+		events = [
+			# empty string -> should NOT emit
+			{"contentBlockDelta": {"delta": {"text": ""}}},
+			# non-string -> should NOT emit
+			{"contentBlockDelta": {"delta": {"text": 999}}},
+			# valid -> should emit
+			{"contentBlockDelta": {"delta": {"text": "hi"}}},
+			# stop via stop-key loop (NOT messageStop dict)
+			{"stop": True},
+			# should be ignored due to stop
+			{"contentBlockDelta": {"delta": {"text": "ignored"}}},
+		]
+
+		collected = []
+		iter_bedrock_stream_text(
+			events,
+			on_text=lambda t: collected.append(t),
+			stream_kind="converse",
+			converse_stop_keys=("stop",),  # force the stop-key loop branch
+		)
+		self.assertEqual(collected, ["hi"])
+
+	def test_auto_skips_unrecognized_dict_event_then_processes_invoke(self):
+		"""
+		Covers auto-mode 'nothing recognizable' branch:
+		- dict event with no converse markers, no stop keys, and no chunk -> continue
+		Then verifies later invoke event is processed.
+		"""
+		events = [
+			{"foo": "bar"},  # unrecognized in auto mode -> should hit the "skip" else/continue branch
+			{"chunk": {"bytes": json.dumps({"delta": {"text": "x"}, "type": "end"}).encode("utf-8")}},
+		]
+
+		collected = []
+		iter_bedrock_stream_text(
+			events,
+			on_text=lambda t: collected.append(t),
+			stream_kind="auto",
+			invoke_stop_types=("end",),
+			# keep converse_stop_keys default or set to something that doesn't exist in the first event
+			converse_stop_keys=("stop", "stopReason"),  # doesn't matter; first event has neither truthy
+		)
+		self.assertEqual(collected, ["x"])
+
 	def test_auto_prefers_converse_and_stops_on_converse_stop(self):
 		events = [
 			{"contentBlockDelta": {"delta": {"text": "conv"}}},
@@ -102,6 +176,87 @@ class TestIterBedrockStreamText(TestCase):
 		collected = []
 		iter_bedrock_stream_text(events, on_text=lambda t: collected.append(t), stream_kind="auto")
 		self.assertEqual(collected, ["conv"])
+
+	def test_auto_routes_to_invoke_and_emits_text_then_stops(self):
+		"""
+		Forces auto-mode to treat an event as INVOKE (chunk present, no converse signals),
+		and ensures the invoke handler's 'emit text' line is executed.
+		This tends to cover the stubborn invoke-side uncovered lines (56-57).
+		"""
+		events = [
+			# auto should decide "invoke" because chunk exists and there are no converse markers
+			{"chunk": {"bytes": json.dumps({"delta": {"text": "hello"}}).encode("utf-8")}},
+			# then stop
+			{"chunk": {"bytes": json.dumps({"delta": {"text": "world"}, "type": "end"}).encode("utf-8")}},
+		]
+
+		collected = []
+		iter_bedrock_stream_text(
+			events,
+			on_text=lambda t: collected.append(t),
+			stream_kind="auto",
+			invoke_stop_types=("end",),  # make stop deterministic regardless of defaults
+		)
+		self.assertEqual(collected, ["hello", "world"])
+
+	def test_converse_emits_text_from_snake_case_content_block_delta(self):
+		"""
+		Forces the converse handler to use the snake_case key
+		`content_block_delta`, not `contentBlockDelta`.
+		This commonly covers the stubborn converse-side uncovered lines (80-81).
+		"""
+		events = [
+			{"content_block_delta": {"delta": {"text": "snake"}}},
+			{"message_stop": {"stopReason": "done"}},
+		]
+
+		collected = []
+		iter_bedrock_stream_text(
+			events,
+			on_text=lambda t: collected.append(t),
+			stream_kind="converse",
+		)
+		self.assertEqual(collected, ["snake"])
+
+	def test_converse_ms_dict_stop_triggers(self):
+		events = [
+			{"contentBlockDelta": {"delta": {"text": "a"}}},
+			{"messageStop": {"stopReason": "done"}},  # <-- ms dict triggers stop
+			{"contentBlockDelta": {"delta": {"text": "ignored"}}},
+		]
+		out = []
+		iter_bedrock_stream_text(events, on_text=out.append, stream_kind="converse", converse_stop_keys=())
+		assert out == ["a"]
+
+	def test_auto_sets_has_converse_via_stop_key_loop_when_no_converse_shape_keys(self):
+		# Use a custom stop key list so we can guarantee which key triggers the branch
+		stop_key = "stopKeyX"
+
+		events = [
+			# This event has NONE of the "shape" keys:
+			# - no contentBlockDelta/content_block_delta
+			# - no messageStop/message_stop
+			#
+			# But it DOES have a truthy stop key, so the else-loop should set has_converse=True and break.
+			{stop_key: True},
+
+			# This would be treated as invoke if we ever got here, but we should stop before it.
+			{"chunk": {"bytes": json.dumps({"delta": {"text": "ignored"}, "type": "end"}).encode("utf-8")}},
+		]
+
+		collected = []
+		iter_bedrock_stream_text(
+			events,
+			on_text=collected.append,
+			stream_kind="auto",
+			converse_stop_keys=(stop_key,),  # <-- forces the else-loop path
+		)
+
+		# No text emitted (we never had a contentBlockDelta), but importantly:
+		# we should have stopped on the first event due to the stop key,
+		# proving the else-loop ran and broke early.
+		self.assertEqual(collected, [])
+
 
 class TestNormalizeHeaders(TestCase):
 	def test_lowercases_keys(self):
