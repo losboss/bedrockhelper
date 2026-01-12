@@ -65,11 +65,11 @@ class BedrockHelper:
 	Parameters
 	----------
 	region_name:
-		AWS region for Bedrock.
+		AWS region for Bedrock. Defaults to ca-central-1
 	rag_model_id:
-		Default model id for RAG chat (Claude, etc.).
+		Default model id for RAG chat (Claude, etc.). Defaults to Claude Sonnet 4.5
 	embedding_model_id:
-		Default model id for embeddings (Titan v2).
+		Default model id for embeddings. Defaults to Titan v2
 	botocore_config:
 		Optional botocore Config for retries/timeouts.
 	s3_client, bedrock_runtime_client, bedrock_client:
@@ -78,9 +78,9 @@ class BedrockHelper:
 
 	def __init__(
 			self,
-			region_name: str = 'ca-central-1',
-			rag_model_id: str = 'global.anthropic.claude-sonnet-4-5-20250929-v1:0',
-			embedding_model_id: str = 'amazon.titan-embed-text-v2:0',
+			region_name: str = os.getenv('AWS_REGION', 'ca-central-1'),
+			rag_model_id: str = os.getenv('AWS_MODEL_ID', 'global.anthropic.claude-sonnet-4-5-20250929-v1:0'),
+			embedding_model_id: str = os.getenv('AWS_EMBEDDING_MODEL_ID', 'amazon.titan-embed-text-v2:0'),
 			*,
 			botocore_config: Optional[Config] = None,
 			s3_client: Optional[Any] = None,
