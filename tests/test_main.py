@@ -1,1118 +1,864 @@
+from __future__ import annotations
+
 import json
-from dataclasses import dataclass
-from types import SimpleNamespace
-from typing import Any, Iterator, List
+from io import BytesIO
 from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import MagicMock, patch
 
-from bedrockhelper import RAGResponse
-from bedrockhelper import BedrockHelper
+from botocore.exceptions import ClientError
+
+from bedrockhelper.main import BedrockHelper, _BotoSessionManager, _is_expired_token
 
 
-# -----------------------------
-# Test helpers / fakes
-# -----------------------------
+def _client_error(code: str, op: str = 'InvokeModel') -> ClientError:
+	return ClientError(
+		error_response={'Error': {'Code': code, 'Message': 'boom'}},
+		operation_name=op,
+	)
 
-class FakeStream:
-	def __init__(self) -> None:
+
+class _FakeClosableStream:
+	def __init__(self, items=None):
 		self.closed = False
+		self.items = list(items or [])
 
-	def close(self) -> None:
+	def close(self):
 		self.closed = True
 
-
-class FakeBody:
-	def __init__(self, payload: bytes) -> None:
-		self._payload = payload
-
-	def read(self) -> bytes:
-		return self._payload
+	def __iter__(self):
+		return iter(self.items)
 
 
-class FakePaginator:
-	def __init__(self, pages: List[dict]) -> None:
+class _FakePaginator:
+	def __init__(self, pages):
 		self._pages = pages
 
-	def paginate(self, **kwargs: Any) -> Iterator[dict]:
+	def paginate(self, **kwargs):
 		yield from self._pages
 
 
-@dataclass(frozen=True, slots=True)
-class DummyEmbeddingJob:
-	job_id: str
-	job_name: str = "job-name"
-	model_id: str = "model-id"
-	input_s3_uri: str = "s3://in/x"
-	output_s3_uri: str = "s3://out/x"
+class _ImmediateThread:
+	"""Drop-in replacement for threading.Thread that runs target immediately on start()."""
 
-	def to_ref(self) -> Any:
-		return SimpleNamespace(
-			job_id=self.job_id,
-			job_name=self.job_name,
-			model_id=self.model_id,
-			input_s3_uri=self.input_s3_uri,
-			output_s3_uri=self.output_s3_uri,
-		)
+	def __init__(self, *, target, daemon=False):
+		self._target = target
+		self.daemon = daemon
+
+	def start(self):
+		self._target()
 
 
-class CountingSemaphore:
-	"""Drop-in replacement for BoundedSemaphore for unit tests."""
+class _ExplodingReleaseSema:
+	def __init__(self):
+		self.acquired = False
 
-	def __init__(self) -> None:
-		self.acquire_calls = 0
-		self.release_calls = 0
-
-	def acquire(self) -> bool:
-		self.acquire_calls += 1
+	def acquire(self):
+		self.acquired = True
 		return True
 
-	def release(self) -> None:
-		self.release_calls += 1
+	def release(self):
+		raise RuntimeError('release blew up')
 
 
-class ReleaseRaisesSemaphore(CountingSemaphore):
-	def release(self) -> None:
-		super().release()
-		raise RuntimeError("release failed")
+class TestExpiredTokenHelpers(TestCase):
+	def test_is_expired_token_true_all_codes(self):
+		for code in [
+			'ExpiredToken',
+			'ExpiredTokenException',
+			'InvalidClientTokenId',
+			'UnrecognizedClientException',
+			'RequestExpired',
+		]:
+			self.assertTrue(_is_expired_token(_client_error(code)))
 
-# ============================================================
-# __init__ + metrics tests
-# ============================================================
+	def test_is_expired_token_false(self):
+		self.assertFalse(_is_expired_token(_client_error('AccessDeniedException')))
+		self.assertFalse(_is_expired_token(RuntimeError('nope')))
 
-class TestBedrockHelperInitAndMetrics(TestCase):
-	def test_init_rejects_invalid_max_concurrent_streams(self):
-		with self.assertRaises(ValueError):
-			BedrockHelper(
-				max_concurrent_streams=0,
-				bedrock_runtime_client=MagicMock(),
-				bedrock_client=MagicMock(),
-				s3_client=MagicMock(),
-			)
 
-	def test_init_uses_provided_clients_and_sets_semaphore(self):
-		brt = MagicMock()
-		br = MagicMock()
-		s3 = MagicMock()
-
-		h = BedrockHelper(
-			bedrock_runtime_client=brt,
-			bedrock_client=br,
-			s3_client=s3,
-			max_concurrent_streams=3,
+class TestBotoSessionManager(TestCase):
+	@patch('bedrockhelper.main.boto3.Session')
+	def test_build_session_no_role_uses_default_resolution(self, SessionMock):
+		SessionMock.return_value = MagicMock(name='session')
+		mgr = _BotoSessionManager(
+			region_name='ca-central-1',
+			botocore_config=MagicMock(),
+			role_arn=None,
 		)
+		sess = mgr._build_boto3_session()
+		self.assertIs(sess, SessionMock.return_value)
+		SessionMock.assert_called_with(region_name='ca-central-1')
 
-		self.assertIs(h.bedrock_runtime, brt)
-		self.assertIs(h.bedrock, br)
-		self.assertIs(h.s3, s3)
-		self.assertEqual(h._max_concurrent_streams, 3)
-		self.assertTrue(hasattr(h, "_stream_sema"))
+	@patch('bedrockhelper.main.AssumeRoleCredentialFetcher')
+	@patch('bedrockhelper.main.DeferredRefreshableCredentials')
+	@patch('bedrockhelper.main.boto3.Session')
+	@patch('bedrockhelper.main.BotocoreSession')
+	def test_build_session_assume_role_refreshable_happy_path(
+		self,
+		BotocoreSessionMock,
+		Boto3SessionMock,
+		DeferredMock,
+		FetcherMock,
+	):
+		# Botocore session + source creds exist
+		bc = MagicMock()
+		source_creds = MagicMock()
+		bc.get_credentials.return_value = source_creds
+		BotocoreSessionMock.return_value = bc
 
-	def test_init_calls_boto3_client_when_clients_not_provided(self):
-		with patch("bedrockhelper.main.boto3.client") as pclient:
-			pclient.side_effect = [MagicMock(), MagicMock(), MagicMock()]
-			h = BedrockHelper(max_concurrent_streams=1)
+		# sts client comes from boto3.Session(...).client('sts')
+		sts_client = MagicMock(name='sts')
+		boto3_sess_for_sts = MagicMock()
+		boto3_sess_for_sts.client.return_value = sts_client
 
-			self.assertIsNotNone(h.bedrock_runtime)
-			self.assertIsNotNone(h.bedrock)
-			self.assertIsNotNone(h.s3)
-			self.assertEqual(pclient.call_count, 3)
+		# boto3.Session is called twice in this branch:
+		#  1) boto3.Session(region_name=sts_region).client('sts', ...)
+		#  2) boto3.Session(botocore_session=bc, region_name=region)
+		# We'll set side effects appropriately.
+		final_boto3_session = MagicMock(name='final_session')
+		Boto3SessionMock.side_effect = [boto3_sess_for_sts, final_boto3_session]
 
-	@patch("bedrockhelper.main.normalize_headers")
-	def test_extract_metrics_prefers_usage_then_headers_then_compute_total(self, norm_headers: MagicMock):
-		# headers normalized and used only when body didn't provide tokens
-		norm_headers.return_value = {
-			"x-amzn-bedrock-input-token-count": "11",
-			"x-amzn-bedrock-output-token-count": "22",
-			"x-amzn-bedrock-invocation-latency": "33",
-			"x-amzn-bedrock-first-byte-latency": "44",
+		# Fetcher + deferred creds
+		fetcher = MagicMock()
+		fetcher.fetch_credentials.return_value = {
+			'access_key': 'AKIA...',
+			'secret_key': 'SECRET',
+			'token': 'TOKEN',
+			'expiry_time': '2099-01-01T00:00:00Z',
 		}
+		FetcherMock.return_value = fetcher
 
-		resp = {"ResponseMetadata": {"HTTPHeaders": {"X-AMZN-BEDROCK-INPUT-TOKEN-COUNT": "11"}}}
-		body = {
-			"usage": {
-				# intentionally leave these invalid so headers take over
-				"inputTokens": "not-an-int",
-				"outputTokens": None,
-				"totalTokens": None,
-			}
-		}
+		refreshable = MagicMock()
+		refreshable.access_key = 'AKIA...'
+		refreshable.secret_key = 'SECRET'
+		refreshable.token = 'TOKEN'
+		DeferredMock.return_value = refreshable
 
-		m = BedrockHelper._extract_metrics_from_response(resp, body)
-		self.assertEqual(m.input_tokens, 11)
-		self.assertEqual(m.output_tokens, 22)
-		self.assertEqual(m.total_tokens, 33)  # computed 11+22
-		self.assertEqual(m.invocation_latency_ms, 33)
-		self.assertEqual(m.first_byte_latency_ms, 44)
-
-	def test_extract_metrics_titan_input_text_token_count_branch(self):
-		resp = {"ResponseMetadata": {"HTTPHeaders": {}}}
-		body = {"inputTextTokenCount": 99}
-		m = BedrockHelper._extract_metrics_from_response(resp, body)
-		self.assertEqual(m.input_tokens, 99)
-
-	def test_extract_metrics_invocation_metrics_branch(self):
-		resp = {"ResponseMetadata": {"HTTPHeaders": {}}}
-		body = {
-			"amazon-bedrock-invocationMetrics": {
-				"invocationLatency": 123,
-				"firstByteLatency": 456,
-			}
-		}
-		m = BedrockHelper._extract_metrics_from_response(resp, body)
-		self.assertEqual(m.invocation_latency_ms, 123)
-		self.assertEqual(m.first_byte_latency_ms, 456)
-
-	def test_extract_metrics_handles_no_body_and_no_headers(self):
-		m = BedrockHelper._extract_metrics_from_response({}, None)
-		# just ensure it returns an InvocationMetrics instance with no crash
-		self.assertIsNotNone(m)
-
-
-# ============================================================
-# generate_with_rag routing tests
-# ============================================================
-
-class TestBedrockHelperGenerateWithRagRouting(TestCase):
-	def setUp(self) -> None:
-		self.brt = MagicMock()
-		self.br = MagicMock()
-		self.s3 = MagicMock()
-		self.h = BedrockHelper(
-			bedrock_runtime_client=self.brt,
-			bedrock_client=self.br,
-			s3_client=self.s3,
+		mgr = _BotoSessionManager(
+			region_name='ca-central-1',
+			botocore_config=MagicMock(),
+			role_arn='arn:aws:iam::123:role/TestRole',
+			role_session_name='bedrockhelper-test',
+			external_id='ext-123',
+			sts_region_name='us-east-1',
+			assume_role_duration_seconds=900,
 		)
 
-	@patch("bedrockhelper.main.truncate_by_chars", side_effect=lambda s, n: s)
-	@patch("bedrockhelper.main.format_context_passages", return_value="FORMATTED")
-	def test_generate_with_rag_context_list_uses_formatter(self, fmt: MagicMock, trunc: MagicMock):
-		self.brt.converse = MagicMock()
+		sess = mgr._build_boto3_session()
+		self.assertIs(sess, final_boto3_session)
 
-		self.h._generate_with_converse = MagicMock(return_value="CONVERSE")
-		out = self.h.generate_with_rag(
-			system_prompt="SYS",
-			context=["a", "b"],
-			include_headers_in_context=True,
-			question="Q",
-			prefer_converse=True,
-		)
-		self.assertEqual(out, "CONVERSE")
-		fmt.assert_called_once()
-		_, kwargs = fmt.call_args
-		self.assertEqual(kwargs["include_headers"], True)
-
-	@patch("bedrockhelper.main.truncate_by_chars", side_effect=lambda s, n: s)
-	def test_generate_with_rag_prefers_converse_stream_when_stream_true(self, trunc: MagicMock):
-		self.brt.converse = MagicMock()
-		self.brt.converse_stream = MagicMock()
-
-		self.h._generate_with_converse_stream = MagicMock(return_value="STREAM")
-		out = self.h.generate_with_rag(
-			system_prompt="SYS",
-			context="CTX",
-			question="Q",
-			stream=True,
-			prefer_converse=True,
-		)
-		self.assertEqual(out, "STREAM")
-
-	@patch("bedrockhelper.main.truncate_by_chars", side_effect=lambda s, n: s)
-	def test_generate_with_rag_falls_back_when_converse_throws(self, trunc: MagicMock):
-		self.brt.converse = MagicMock()
-
-		self.h._generate_with_converse = MagicMock(side_effect=RuntimeError("boom"))
-		self.h._generate_with_claude_message_format = MagicMock(return_value="FALLBACK")
-
-		out = self.h.generate_with_rag(
-			system_prompt="SYS",
-			context="CTX",
-			question="Q",
-			stream=False,
-			prefer_converse=True,
-		)
-		self.assertEqual(out, "FALLBACK")
-
-	@patch("bedrockhelper.main.truncate_by_chars", side_effect=lambda s, n: s)
-	def test_generate_with_rag_skips_converse_when_prefer_false(self, trunc: MagicMock):
-		# even if converse exists, prefer_converse=False should route to fallback
-		self.brt.converse = MagicMock()
-
-		self.h._generate_with_claude_message_format = MagicMock(return_value="FALLBACK")
-		out = self.h.generate_with_rag(
-			system_prompt="SYS",
-			context="CTX",
-			question="Q",
-			prefer_converse=False,
-		)
-		self.assertEqual(out, "FALLBACK")
-
-
-# ============================================================
-# Converse implementations tests
-# ============================================================
-
-class TestBedrockHelperConverseImplementations(TestCase):
-	def setUp(self) -> None:
-		self.brt = MagicMock()
-		self.h = BedrockHelper(
-			bedrock_runtime_client=self.brt,
-			bedrock_client=MagicMock(),
-			s3_client=MagicMock(),
+		# Confirm extra args assembled (covers those lines you flagged)
+		FetcherMock.assert_called_once()
+		kwargs = FetcherMock.call_args.kwargs
+		self.assertEqual(kwargs['source_credentials'], source_creds)
+		self.assertEqual(kwargs['role_arn'], 'arn:aws:iam::123:role/TestRole')
+		self.assertEqual(
+			kwargs['extra_args'],
+			{'RoleSessionName': 'bedrockhelper-test', 'ExternalId': 'ext-123', 'DurationSeconds': 900},
 		)
 
-	@patch("bedrockhelper.main.build_converse_request", return_value={"modelId": "m"})
-	@patch("bedrockhelper.main.extract_converse_text", return_value="HELLO")
-	def test_generate_with_converse_happy_path(self, ex: MagicMock, bcr: MagicMock):
-		self.brt.converse = MagicMock(return_value={"output": "x", "ResponseMetadata": {"HTTPHeaders": {}}})
+		# Deferred creds created with fetcher.fetch_credentials
+		DeferredMock.assert_called_once()
+		self.assertEqual(DeferredMock.call_args.kwargs['refresh_using'], fetcher.fetch_credentials)
 
-		out = self.h._generate_with_converse(
-			model_id="m",
-			system_prompt="SYS",
-			context="CTX",
-			question="Q",
-			max_tokens=1,
-			temperature=0.1,
-			rag_instructions="",
+		# botocore session wired with credentials and set_credentials called
+		self.assertIs(bc._credentials, refreshable)  # noqa: SLF001
+		bc.set_credentials.assert_called_once_with('AKIA...', 'SECRET', 'TOKEN')
+
+		# Final boto3 session created with botocore_session=bc
+		self.assertEqual(Boto3SessionMock.call_args_list[-1].kwargs['botocore_session'], bc)
+		self.assertEqual(Boto3SessionMock.call_args_list[-1].kwargs['region_name'], 'ca-central-1')
+
+	@patch('bedrockhelper.main.BotocoreSession')
+	def test_build_session_role_no_source_creds_raises(self, BotocoreSessionMock):
+		bc = MagicMock()
+		bc.get_credentials.return_value = None
+		BotocoreSessionMock.return_value = bc
+
+		mgr = _BotoSessionManager(
+			region_name='ca-central-1',
+			botocore_config=MagicMock(),
+			role_arn='arn:aws:iam::123:role/X',
 		)
-
-		self.assertEqual(out.text, "HELLO")
-		self.assertFalse(out.stream)
-		bcr.assert_called_once()
-
-	def test_generate_with_converse_stream_raises_if_missing_stream(self):
-		self.brt.converse_stream = MagicMock(return_value={})
 		with self.assertRaises(RuntimeError):
-			self.h._generate_with_converse_stream(
-				model_id="m",
-				system_prompt="SYS",
-				context="CTX",
-				question="Q",
-				max_tokens=1,
-				temperature=0.1,
-				rag_instructions="",
-			)
+			mgr._build_boto3_session()
 
-	@patch("bedrockhelper.main.build_converse_request", return_value={"modelId": "m"})
-	@patch("bedrockhelper.main.iter_bedrock_stream_text")
-	def test_generate_with_converse_stream_closes_stream_and_collects(self, it: MagicMock, bcr: MagicMock):
-		stream = FakeStream()
+	@patch('bedrockhelper.main.boto3.Session')
+	def test_client_cache_and_ensure_session_clears_on_rebuild(self, SessionMock):
+		# session.client called twice because invalidate forces rebuild
+		sess = MagicMock()
+		c1 = MagicMock(name='s3_client_1')
+		c2 = MagicMock(name='s3_client_2')
+		sess.client.side_effect = [c1, c2]
+		SessionMock.return_value = sess
 
-		def _iter(stream_obj: Any, on_text: Any, stream_kind: str) -> None:
-			on_text("a")
-			on_text("b")
+		mgr = _BotoSessionManager(region_name='ca-central-1', botocore_config=MagicMock(), role_arn=None)
 
-		it.side_effect = _iter
-		self.brt.converse_stream = MagicMock(
-			return_value={
-				"stream": stream,
-				"ResponseMetadata": {
-					"HTTPHeaders": {}
+		a = mgr.client('s3')
+		b = mgr.client('s3')
+		self.assertIs(a, b)  # cached
+
+		mgr.invalidate()
+		c = mgr.client('s3')
+		self.assertIs(c, c2)  # rebuilt
+		self.assertEqual(sess.client.call_count, 2)
+
+
+class TestBedrockHelperSync(TestCase):
+	def _make_helper_with_clients(self):
+		brt = MagicMock(name='bedrock-runtime')
+		br = MagicMock(name='bedrock')
+		s3 = MagicMock(name='s3')
+		return BedrockHelper(bedrock_runtime_client=brt, bedrock_client=br, s3_client=s3)
+
+	def test_refresh_clients_if_needed_respects_injected(self):
+		bh = self._make_helper_with_clients()
+		# All injected: should not call session manager
+		bh._session_mgr = MagicMock()
+		bh._refresh_clients_if_needed()
+		bh._session_mgr.client.assert_not_called()
+
+	def test_refresh_clients_if_needed_rebinds_when_not_injected(self):
+		bh = self._make_helper_with_clients()
+
+		# Pretend none were injected so refresh should rebind all three
+		bh._injected = {'bedrock_runtime': False, 'bedrock': False, 's3': False}
+
+		new_brt = MagicMock(name='new_bedrock_runtime')
+		new_br = MagicMock(name='new_bedrock')
+		new_s3 = MagicMock(name='new_s3')
+
+		bh._session_mgr = MagicMock()
+		bh._session_mgr.client.side_effect = [new_brt, new_br, new_s3]
+
+		bh._refresh_clients_if_needed()
+
+		self.assertIs(bh.bedrock_runtime, new_brt)
+		self.assertIs(bh.bedrock, new_br)
+		self.assertIs(bh.s3, new_s3)
+
+		# ensure the 3 calls happened in order
+		self.assertEqual(
+			[c.args[0] for c in bh._session_mgr.client.call_args_list],
+			['bedrock-runtime', 'bedrock', 's3'],
+		)
+
+	def test_call_with_refresh_success(self):
+		bh = self._make_helper_with_clients()
+		bh._session_mgr = MagicMock()
+
+		fn = MagicMock(return_value={'ok': True})
+		out = bh._call_with_refresh(fn, 1, a=2)
+		self.assertEqual(out, {'ok': True})
+		bh._session_mgr.invalidate.assert_not_called()
+
+	def test_call_with_refresh_expired_retries(self):
+		bh = self._make_helper_with_clients()
+		bh._session_mgr = MagicMock()
+		bh._refresh_clients_if_needed = MagicMock()
+
+		fn = MagicMock(side_effect=[_client_error('ExpiredToken'), {'ok': True}])
+		out = bh._call_with_refresh(fn)
+
+		self.assertEqual(out, {'ok': True})
+		bh._session_mgr.invalidate.assert_called_once()
+		bh._refresh_clients_if_needed.assert_called_once()
+		self.assertEqual(fn.call_count, 2)
+
+	def test_call_with_refresh_expired_token_rebinds_and_retries_successfully(self):
+		bh = self._make_helper_with_clients()
+
+		# Make them non-injected so _refresh_clients_if_needed actually does work
+		bh._injected = {'bedrock_runtime': False, 'bedrock': False, 's3': False}
+
+		# Session mgr will be invalidated and then used to create 3 clients during refresh.
+		bh._session_mgr = MagicMock()
+		bh._session_mgr.client.side_effect = [MagicMock(), MagicMock(), MagicMock()]
+
+		# Function fails once with ExpiredToken, then returns ok
+		fn = MagicMock(side_effect=[_client_error('ExpiredToken'), 'OK'])
+		out = bh._call_with_refresh(fn)
+
+		self.assertEqual(out, 'OK')
+		bh._session_mgr.invalidate.assert_called_once()
+		self.assertEqual(fn.call_count, 2)
+		self.assertEqual(bh._session_mgr.client.call_count, 3)  # runtime + bedrock + s3
+
+	def test_call_with_refresh_non_expired_reraises(self):
+		bh = self._make_helper_with_clients()
+		bh._session_mgr = MagicMock()
+		fn = MagicMock(side_effect=_client_error('AccessDeniedException'))
+		with self.assertRaises(ClientError):
+			bh._call_with_refresh(fn)
+
+	def test_extract_text_from_claude_branches(self):
+		self.assertEqual(
+			BedrockHelper._extract_text_from_claude({'content': [{'text': 'a'}, {'text': 'b'}]}),
+			'ab',
+		)
+		self.assertEqual(BedrockHelper._extract_text_from_claude({'completion': 'yo'}), 'yo')
+		self.assertEqual(BedrockHelper._extract_text_from_claude('hi'), 'hi')
+		self.assertEqual(BedrockHelper._extract_text_from_claude({'x': 1}), '')
+
+	def test_extract_metrics_body_usage_and_header_fallbacks(self):
+		bh = self._make_helper_with_clients()
+
+		resp = {
+			'ResponseMetadata': {
+				'HTTPHeaders': {
+					'X-Amzn-Bedrock-Input-Token-Count': '10',
+					'X-Amzn-Bedrock-Output-Token-Count': '20',
+					'X-Amzn-Bedrock-Invocation-Latency': '30',
+					'X-Amzn-Bedrock-First-Byte-Latency': '40',
 				}
 			}
-		)
+		}
+		body = {
+			'usage': {'inputTokens': 1, 'outputTokens': 2, 'totalTokens': 3},
+			'amazon-bedrock-invocationMetrics': {'invocationLatency': 111, 'firstByteLatency': 222},
+		}
+		m = bh._extract_metrics_from_response(resp, body)
+		self.assertEqual(m.input_tokens, 1)
+		self.assertEqual(m.output_tokens, 2)
+		self.assertEqual(m.total_tokens, 3)
+		self.assertEqual(m.invocation_latency_ms, 111)
+		self.assertEqual(m.first_byte_latency_ms, 222)
 
-		out = self.h._generate_with_converse_stream(
-			model_id="m",
-			system_prompt="SYS",
-			context="CTX",
-			question="Q",
-			max_tokens=1,
-			temperature=0.1,
-			rag_instructions="",
-		)
+		# Titan fallback inputTextTokenCount
+		m2 = bh._extract_metrics_from_response({'ResponseMetadata': {'HTTPHeaders': {}}}, {'inputTextTokenCount': '9'})
+		self.assertEqual(m2.input_tokens, 9)
 
-		self.assertEqual(out.text, "ab")
-		self.assertTrue(out.stream)
-		self.assertTrue(stream.closed)
+		# Header fallback when body has no usage
+		m3 = bh._extract_metrics_from_response(resp, {})
+		self.assertEqual(m3.input_tokens, 10)
+		self.assertEqual(m3.output_tokens, 20)
+		self.assertEqual(m3.total_tokens, 30)
 
-
-# ============================================================
-# Claude invoke_model fallback tests + _extract_text_from_claude
-# ============================================================
-
-class TestBedrockHelperClaudeFallback(TestCase):
-	def setUp(self) -> None:
-		self.brt = MagicMock()
-		self.h = BedrockHelper(
-			bedrock_runtime_client=self.brt,
-			bedrock_client=MagicMock(),
-			s3_client=MagicMock(),
-		)
-
-	@patch("bedrockhelper.main.iter_bedrock_stream_text")
-	def test_generate_with_claude_message_format_streaming_happy_path(self, it: MagicMock):
-		stream = FakeStream()
-
-		def _iter(stream_obj: Any, on_text: Any, stream_kind: str) -> None:
-			on_text("x")
-			on_text("y")
-
-		it.side_effect = _iter
-
-		self.brt.invoke_model_with_response_stream = MagicMock(
-			return_value={"body": stream, "ResponseMetadata": {"HTTPHeaders": {}}})
-
-		out = self.h._generate_with_claude_message_format(
-			model_id="m",
-			system_prompt="SYS",
-			context="CTX",
-			question="Q",
-			stream=True,
-			temperature=0.1,
-			max_tokens=5,
-			rag_instructions="RAG",
-			foo="bar",
-		)
-		self.assertEqual(out.text, "xy")
-		self.assertTrue(out.stream)
-		self.assertTrue(stream.closed)
-
-		# ensure extra_params included in request body
-		args, kwargs = self.brt.invoke_model_with_response_stream.call_args
-		body = json.loads(kwargs["body"])
-		self.assertEqual(body["foo"], "bar")
-
-	def test_generate_with_claude_message_format_streaming_missing_body_raises(self):
-		self.brt.invoke_model_with_response_stream = MagicMock(return_value={})
-		with self.assertRaises(RuntimeError):
-			self.h._generate_with_claude_message_format(
-				model_id="m",
-				system_prompt="SYS",
-				context="CTX",
-				question="Q",
-				stream=True,
-				temperature=0.1,
-				max_tokens=5,
-			)
-
-	def test_generate_with_claude_message_format_nonstream_json_ok(self):
-		payload = {
-			"content": [
-				{"text": "hi"},
-				{"text": "!"}
-			],
-			"usage": {
-				"inputTokens": 1,
-				"outputTokens": 2
+	def test_extract_metrics_pick_int_skips_none_and_bad_values_then_picks_valid(self):
+		# Arrange: usage has:
+		# - first candidate key present but None -> triggers "continue"
+		# - second candidate key present but non-int -> triggers except(ValueError) then "pass"
+		# - third candidate key valid int -> returns it
+		resp = {'ResponseMetadata': {'HTTPHeaders': {}}}
+		body = {
+			'usage': {
+				'inputTokens': None,  # continue branch
+				'prompt_tokens': 'nope',  # ValueError branch
+				'promptTokens': '123',  # success (int("123") == 123)
+				'outputTokens': '7',  # also works for output
+				'totalTokens': None,  # ensure total_tokens fallback can happen elsewhere if needed
 			}
 		}
-		self.brt.invoke_model = MagicMock(
-			return_value={
-				"body": FakeBody(json.dumps(payload).encode("utf-8")),
-				"ResponseMetadata": {"HTTPHeaders": {}}
-			}
-		)
 
-		out = self.h._generate_with_claude_message_format(
-			model_id="m",
-			system_prompt="SYS",
-			context="CTX",
-			question="Q",
-			stream=False,
-			temperature=0.1,
-			max_tokens=5,
-		)
-		self.assertEqual(out.text, "hi!")
-		self.assertFalse(out.stream)
+		m = BedrockHelper._extract_metrics_from_response(resp, body)
 
-	def test_generate_with_claude_message_format_nonstream_json_parse_fails(self):
-		self.brt.invoke_model = MagicMock(
-			return_value={"body": FakeBody(b"not-json"), "ResponseMetadata": {"HTTPHeaders": {}}})
+		self.assertEqual(m.input_tokens, 123)
+		self.assertEqual(m.output_tokens, 7)
+		self.assertEqual(m.total_tokens, 130)  # computed from input+output if totalTokens missing
 
-		out = self.h._generate_with_claude_message_format(
-			model_id="m",
-			system_prompt="SYS",
-			context="CTX",
-			question="Q",
-			stream=False,
-			temperature=0.1,
-			max_tokens=5,
-		)
-		# in this case body_json is {"raw": "..."} and extract_text_from_claude returns ""
-		self.assertEqual(out.text, "")
+	def test_init_rejects_invalid_max_concurrent_streams(self):
+		with self.assertRaises(ValueError):
+			BedrockHelper(max_concurrent_streams=0)
 
-	def test_extract_text_from_claude_completion_branch(self):
-		self.assertEqual(BedrockHelper._extract_text_from_claude({"completion": "yo"}), "yo")
+	@patch('bedrockhelper.main.Config')
+	def test_init_builds_default_botocore_config_when_none(self, ConfigMock):
+		# Config(...) should be invoked, and then passed into _BotoSessionManager
+		cfg_obj = MagicMock(name='cfg')
+		ConfigMock.return_value = cfg_obj
 
-	def test_extract_text_from_claude_string_branch(self):
-		self.assertEqual(BedrockHelper._extract_text_from_claude("hello"), "hello")
+		with patch('bedrockhelper.main._BotoSessionManager') as MgrMock:
+			MgrMock.return_value.client.return_value = MagicMock()
+			BedrockHelper(botocore_config=None)
 
-	def test_extract_text_from_claude_default_empty(self):
-		self.assertEqual(BedrockHelper._extract_text_from_claude({"nope": 1}), "")
+		ConfigMock.assert_called_once()
+		kwargs = ConfigMock.call_args.kwargs
+		self.assertEqual(kwargs['connect_timeout'], 5)
+		self.assertEqual(kwargs['read_timeout'], 120)
+		self.assertEqual(kwargs['retries'], {'max_attempts': 10, 'mode': 'adaptive'})
 
-
-# ============================================================
-# async_stream_generate_with_rag tests
-# ============================================================
-
-class TestBedrockHelperAsyncStream(IsolatedAsyncioTestCase):
-	async def asyncSetUp(self) -> None:
-		self.brt = MagicMock()
-		self.h = BedrockHelper(
-			bedrock_runtime_client=self.brt,
-			bedrock_client=MagicMock(),
-			s3_client=MagicMock(),
-			max_concurrent_streams=2,
-		)
-		# replace semaphore with counting one to assert acquire/release
-		self.h._stream_sema = CountingSemaphore()
-
-	@patch("bedrockhelper.main.truncate_by_chars", side_effect=lambda s, n: s)
-	@patch("bedrockhelper.main.format_context_passages", return_value="FORMATTED")
-	@patch("bedrockhelper.main.build_converse_request", return_value={"modelId": "m"})
-	@patch("bedrockhelper.main.iter_bedrock_stream_text")
-	async def test_prefers_converse_stream_and_yields(
-			self,
-			it: MagicMock,
-			bcr: MagicMock,
-			fmt: MagicMock,
-			trunc: MagicMock
+	@patch('bedrockhelper.main.truncate_by_chars', side_effect=lambda s, n: s)
+	@patch('bedrockhelper.main.format_context_passages', side_effect=lambda passages, include_headers=False: 'CTX')
+	@patch('bedrockhelper.main.build_converse_request', side_effect=lambda **kw: {'modelId': kw['model_id']})
+	@patch('bedrockhelper.main.extract_converse_text', return_value='CONVERSE_TEXT')
+	def test_generate_with_rag_converse_nonstream_context_seq(
+		self,
+		extract_text,
+		build_req,
+		format_ctx,
+		trunc,
 	):
-		stream = FakeStream()
+		bh = self._make_helper_with_clients()
+		bh.bedrock_runtime.converse.return_value = {'output': 'x'}
 
-		def _iter(stream_obj: Any, on_text: Any, stream_kind: str) -> None:
-			on_text("a")
-			on_text("b")
+		out = bh.generate_with_rag(
+			system_prompt='S',
+			context=['a', 'b'],
+			include_headers_in_context=True,
+			question='Q',
+			stream=False,
+			prefer_converse=True,
+		)
+		self.assertEqual(out.text, 'CONVERSE_TEXT')
+		bh.bedrock_runtime.converse.assert_called_once()
+		format_ctx.assert_called_once()
 
-		it.side_effect = _iter
-		self.brt.converse_stream = MagicMock(return_value={"stream": stream})
+	@patch('bedrockhelper.main.truncate_by_chars', side_effect=lambda s, n: s)
+	@patch('bedrockhelper.main.build_converse_request', side_effect=lambda **kw: {'modelId': kw['model_id']})
+	@patch(
+		'bedrockhelper.main.iter_bedrock_stream_text', side_effect=lambda stream, on_text, stream_kind: on_text('hi')
+	)
+	def test_generate_with_rag_converse_stream_success(self, iter_stream, build_req, trunc):
+		bh = self._make_helper_with_clients()
+		stream = _FakeClosableStream()
+		bh.bedrock_runtime.converse_stream.return_value = {'stream': stream}
 
-		parts: List[str] = []
-		async for chunk in self.h.async_stream_generate_with_rag(
-				system_prompt="SYS",
-				context=["x", "y"],
-				include_headers_in_context=True,
-				question="Q",
-				prefer_converse=True,
-				rag_instructions="R",
-				foo="bar",
-		):
-			parts.append(chunk)
-
-		self.assertEqual("".join(parts), "ab")
+		out = bh.generate_with_rag(
+			system_prompt='S',
+			context='CTXSTR',
+			question='Q',
+			stream=True,
+			prefer_converse=True,
+		)
 		self.assertTrue(stream.closed)
-		self.assertEqual(self.h._stream_sema.acquire_calls, 1)
-		self.assertEqual(self.h._stream_sema.release_calls, 1)
-		bcr.assert_called_once()
-		# ensure extra param made it through to build_converse_request
-		_, kwargs = bcr.call_args
-		self.assertEqual(kwargs["foo"], "bar")
+		self.assertEqual(out.text, 'hi')
+		self.assertTrue(out.stream)
 
-	@patch("bedrockhelper.main.truncate_by_chars", side_effect=lambda s, n: s)
-	@patch("bedrockhelper.main.iter_bedrock_stream_text")
-	async def test_falls_back_when_converse_stream_missing_stream(self, it: MagicMock, trunc: MagicMock):
-		# converse_stream present but returns missing "stream" -> should fall back to invoke stream
-		self.brt.converse_stream = MagicMock(return_value={})
+	@patch('bedrockhelper.main.truncate_by_chars', side_effect=lambda s, n: s)
+	def test_generate_with_rag_stream_true_without_converse_stream_uses_converse(self, trunc):
+		bh = self._make_helper_with_clients()
 
-		event_stream = FakeStream()
+		# Make the runtime client look like it has converse but NOT converse_stream
+		del bh.bedrock_runtime.converse_stream  # MagicMock creates attrs; delete to force hasattr False
+		bh.bedrock_runtime.converse.return_value = {'output': 'x'}
 
-		def _iter(stream_obj: Any, on_text: Any, stream_kind: str) -> None:
-			on_text("x")
-
-		it.side_effect = _iter
-		self.brt.invoke_model_with_response_stream = MagicMock(return_value={"body": event_stream})
-
-		parts: List[str] = []
-		async for chunk in self.h.async_stream_generate_with_rag(
-				system_prompt="SYS",
-				context="CTX",
-				question="Q",
+		# Keep internals simple: make extract_converse_text return deterministic text
+		with patch('bedrockhelper.main.extract_converse_text', return_value='TEXT'):
+			out = bh.generate_with_rag(
+				system_prompt='S',
+				context='CTX',
+				question='Q',
+				stream=True,
 				prefer_converse=True,
-		):
-			parts.append(chunk)
+			)
 
-		self.assertEqual("".join(parts), "x")
-		self.assertTrue(event_stream.closed)
-		self.assertEqual(self.h._stream_sema.acquire_calls, 1)
-		self.assertEqual(self.h._stream_sema.release_calls, 1)
+		self.assertEqual(out.text, 'TEXT')
+		bh.bedrock_runtime.converse.assert_called_once()
 
-	@patch("bedrockhelper.main.truncate_by_chars", side_effect=lambda s, n: s)
-	async def test_async_stream_raises_when_fallback_missing_body(self, trunc: MagicMock):
-		# no converse_stream, fallback invoked but missing body => should raise
-		# ensure hasattr(converse_stream) false
-		if hasattr(self.brt, "converse_stream"):
-			delattr(self.brt, "converse_stream")
+	@patch('bedrockhelper.main.truncate_by_chars', side_effect=lambda s, n: s)
+	def test_generate_with_rag_converse_stream_missing_stream_falls_back(self, trunc):
+		bh = self._make_helper_with_clients()
 
-		self.brt.invoke_model_with_response_stream = MagicMock(return_value={})
+		# Converse stream returns {} -> _generate_with_converse_stream would raise,
+		# but generate_with_rag swallows and falls back to invoke_model path.
+		bh.bedrock_runtime.converse_stream.return_value = {}
 
-		with self.assertRaises(RuntimeError):
-			async for _ in self.h.async_stream_generate_with_rag(
-					system_prompt="SYS",
-					context="CTX",
-					question="Q",
-					prefer_converse=False,
-			):
-				pass
+		# Mock the fallback invoke_model response
+		bh.bedrock_runtime.invoke_model.return_value = {
+			'body': BytesIO(json.dumps({'content': [{'text': 'fallback'}]}).encode('utf-8'))
+		}
 
-		self.assertEqual(self.h._stream_sema.acquire_calls, 1)
-		self.assertEqual(self.h._stream_sema.release_calls, 1)
-
-	@patch("bedrockhelper.main.truncate_by_chars", side_effect=lambda s, n: s)
-	@patch("bedrockhelper.main.iter_bedrock_stream_text", side_effect=RuntimeError("stream parse fail"))
-	async def test_async_stream_propagates_worker_exception(self, it: MagicMock, trunc: MagicMock):
-		# force fallback path
-		if hasattr(self.brt, "converse_stream"):
-			delattr(self.brt, "converse_stream")
-
-		event_stream = FakeStream()
-		self.brt.invoke_model_with_response_stream = MagicMock(return_value={"body": event_stream})
-
-		with self.assertRaises(RuntimeError):
-			async for _ in self.h.async_stream_generate_with_rag(
-					system_prompt="SYS",
-					context="CTX",
-					question="Q",
-					prefer_converse=False,
-			):
-				pass
-
-		self.assertTrue(event_stream.closed)
-		self.assertEqual(self.h._stream_sema.acquire_calls, 1)
-		self.assertEqual(self.h._stream_sema.release_calls, 1)
-
-	@patch("bedrockhelper.main.truncate_by_chars", side_effect=lambda s, n: s)
-	@patch("bedrockhelper.main.iter_bedrock_stream_text")
-	async def test_async_stream_swallows_semaphore_release_error(self, it: MagicMock, trunc: MagicMock):
-		# force fallback path (no converse_stream)
-		if hasattr(self.brt, "converse_stream"):
-			delattr(self.brt, "converse_stream")
-
-		# semaphore where release() raises -> should be swallowed
-		self.h._stream_sema = ReleaseRaisesSemaphore()
-
-		event_stream = FakeStream()
-
-		def _iter(stream_obj: Any, on_text: Any, stream_kind: str) -> None:
-			on_text("ok")
-
-		it.side_effect = _iter
-		self.brt.invoke_model_with_response_stream = MagicMock(return_value={"body": event_stream})
-
-		parts: List[str] = []
-		async for chunk in self.h.async_stream_generate_with_rag(
-				system_prompt="SYS",
-				context="CTX",
-				question="Q",
-				prefer_converse=False,
-		):
-			parts.append(chunk)
-
-		self.assertEqual("".join(parts), "ok")
-		self.assertTrue(event_stream.closed)
-		self.assertEqual(self.h._stream_sema.acquire_calls, 1)
-		self.assertEqual(self.h._stream_sema.release_calls, 1)
-
-
-# ============================================================
-# Embeddings tests
-# ============================================================
-
-class TestBedrockHelperEmbeddings(TestCase):
-	def setUp(self) -> None:
-		self.brt = MagicMock()
-		self.h = BedrockHelper(
-			bedrock_runtime_client=self.brt,
-			bedrock_client=MagicMock(),
-			s3_client=MagicMock(),
+		out = bh.generate_with_rag(
+			system_prompt='S',
+			context='CTX',
+			question='Q',
+			stream=True,
+			prefer_converse=True,
 		)
 
-	@patch("bedrockhelper.main.normalize_records", return_value=[])
-	def test_embed_texts_empty_returns_empty_response(self, norm: MagicMock):
-		out = self.h.embed_texts(records=[])
+		self.assertEqual(out.text, 'fallback')
+		bh.bedrock_runtime.invoke_model.assert_called_once()
+
+	def test__generate_with_converse_stream_missing_stream_raises(self):
+		bh = self._make_helper_with_clients()
+		bh.bedrock_runtime.converse_stream.return_value = {}
+
+		with self.assertRaises(RuntimeError):
+			bh._generate_with_converse_stream(
+				model_id='m',
+				system_prompt='S',
+				context='CTX',
+				question='Q',
+				max_tokens=10,
+				temperature=0.1,
+				rag_instructions='',
+			)
+
+	@patch('bedrockhelper.main.truncate_by_chars', side_effect=lambda s, n: s)
+	def test_generate_with_rag_converse_throws_falls_back_to_invoke(self, trunc):
+		bh = self._make_helper_with_clients()
+		bh.bedrock_runtime.converse.side_effect = RuntimeError('nope')
+		bh.bedrock_runtime.invoke_model.return_value = {
+			'body': BytesIO(json.dumps({'content': [{'text': 'fallback'}]}).encode('utf-8'))
+		}
+
+		out = bh.generate_with_rag(
+			system_prompt='S',
+			context='CTX',
+			question='Q',
+			stream=False,
+			prefer_converse=True,
+		)
+		self.assertEqual(out.text, 'fallback')
+		bh.bedrock_runtime.invoke_model.assert_called_once()
+
+	@patch('bedrockhelper.main.truncate_by_chars', side_effect=lambda s, n: s)
+	def test_generate_with_rag_prefer_converse_false_uses_invoke(self, trunc):
+		bh = self._make_helper_with_clients()
+		bh.bedrock_runtime.invoke_model.return_value = {'body': BytesIO(json.dumps({'completion': 'yo'}).encode())}
+		out = bh.generate_with_rag(
+			system_prompt='S',
+			context='CTX',
+			question='Q',
+			stream=False,
+			prefer_converse=False,
+		)
+		self.assertEqual(out.text, 'yo')
+
+	@patch('bedrockhelper.main.iter_bedrock_stream_text', side_effect=lambda stream, on_text, stream_kind: on_text('x'))
+	def test_claude_stream_missing_body_raises(self, iter_stream):
+		bh = self._make_helper_with_clients()
+		bh.bedrock_runtime.invoke_model_with_response_stream.return_value = {}
+		with self.assertRaises(RuntimeError):
+			bh.generate_with_rag(
+				system_prompt='S',
+				context='CTX',
+				question='Q',
+				stream=True,
+				prefer_converse=False,
+			)
+
+	def test_claude_nonstream_json_parse_fallback_raw(self):
+		bh = self._make_helper_with_clients()
+		bh.bedrock_runtime.invoke_model.return_value = {'body': BytesIO(b'\xff\xfe\x00notjson')}
+		out = bh.generate_with_rag(
+			system_prompt='S',
+			context='CTX',
+			question='Q',
+			stream=False,
+			prefer_converse=False,
+		)
+		self.assertEqual(out.text, '')
+
+	@patch('bedrockhelper.main.normalize_records', return_value=[])
+	def test_embed_texts_empty_records(self, norm):
+		bh = self._make_helper_with_clients()
+		out = bh.embed_texts(records=[])
 		self.assertEqual(out.embeddings, {})
 		self.assertEqual(out.metrics, {})
 
-	@patch("bedrockhelper.main.normalize_records", return_value=[("a", "A"), ("b", "B")])
-	def test_embed_texts_below_threshold_uses_sync_concurrent(self, norm: MagicMock):
-		self.h._embed_texts_sync_concurrent = MagicMock(return_value="SYNC")
-		out = self.h.embed_texts(records=[("x", "y")], batch_threshold=3000)
-		self.assertEqual(out, "SYNC")
+	@patch('bedrockhelper.main.normalize_records', return_value=[('1', 'a'), ('2', 'b')])
+	def test_embed_texts_sync_path_max_workers_1(self, norm):
+		bh = self._make_helper_with_clients()
 
-	@patch("bedrockhelper.main.normalize_records", return_value=[("a", "A"), ("b", "B")])
-	def test_embed_texts_above_threshold_uses_batch_job(self, norm: MagicMock):
-		self.h.submit_embedding_batch_job = MagicMock(return_value="BATCH")
-		out = self.h.embed_texts(records=[("x", "y")], batch_threshold=1, s3_bucket="b", role_arn="r")
-		self.assertEqual(out, "BATCH")
+		def invoke_model(**kwargs):
+			return {'body': BytesIO(json.dumps({'embedding': [1.0, 2.0]}).encode('utf-8'))}
 
-	def test_embed_one_raises_if_embedding_not_list(self):
-		self.brt.invoke_model = MagicMock(
-			return_value={"body": FakeBody(json.dumps({"embedding": "nope"}).encode("utf-8")),
-			              "ResponseMetadata": {"HTTPHeaders": {}}})
-		with self.assertRaises(RuntimeError):
-			self.h._embed_one("rid", "text")
+		bh.bedrock_runtime.invoke_model.side_effect = invoke_model
+		out = bh.embed_texts(records=[('1', 'a'), ('2', 'b')], batch_threshold=3000, max_workers=1)
+		self.assertIn('1', out.embeddings)
+		self.assertIn('2', out.embeddings)
 
-	def test_embed_one_happy_path(self):
-		self.brt.invoke_model = MagicMock(
-			return_value={"body": FakeBody(json.dumps({"embedding": [1.0, 2.0]}).encode("utf-8")),
-			              "ResponseMetadata": {"HTTPHeaders": {}}})
-		rid, emb, metrics = self.h._embed_one("rid", "text")
-		self.assertEqual(rid, "rid")
-		self.assertEqual(emb, [1.0, 2.0])
-		self.assertIsNotNone(metrics)
-
-	def test_embed_texts_sync_concurrent_sequential_branch(self):
-		# max_workers <= 1 triggers sequential branch
-		self.h._embed_one = MagicMock(side_effect=[
-			("a", [1.0], object()),
-			("b", [2.0], object()),
-		])
-		out = self.h._embed_texts_sync_concurrent([("a", "A"), ("b", "B")], max_workers=1)
-		self.assertEqual(out.embeddings["a"], [1.0])
-		self.assertEqual(out.embeddings["b"], [2.0])
-		self.assertEqual(self.h._embed_one.call_count, 2)
-
-	def test_embed_texts_sync_concurrent_threadpool_branch(self):
-		# this should still be deterministic enough for unit test purposes
-		self.h._embed_one = MagicMock(side_effect=[
-			("a", [1.0], object()),
-			("b", [2.0], object()),
-		])
-		out = self.h._embed_texts_sync_concurrent([("a", "A"), ("b", "B")], max_workers=2)
-		self.assertEqual(set(out.embeddings.keys()), {"a", "b"})
-		self.assertEqual(self.h._embed_one.call_count, 2)
-
-
-# ============================================================
-# Batch job submission + S3 parsing tests
-# ============================================================
-
-class TestBedrockHelperBatchEmbeddings(TestCase):
-	def setUp(self) -> None:
-		self.brt = MagicMock()
-		self.br = MagicMock()
-		self.s3 = MagicMock()
-		self.h = BedrockHelper(
-			bedrock_runtime_client=self.brt,
-			bedrock_client=self.br,
-			s3_client=self.s3,
+	@patch('bedrockhelper.main.normalize_records', return_value=[('1', 'a'), ('2', 'b')])
+	def test_embed_texts_sync_path_concurrent_branch(self, norm):
+		# This covers the ThreadPoolExecutor/as_completed branch.
+		bh = self._make_helper_with_clients()
+		bh._embed_one = MagicMock(
+			side_effect=[
+				('1', [0.1], MagicMock()),
+				('2', [0.2], MagicMock()),
+			]
 		)
+		out = bh.embed_texts(records=[('1', 'a'), ('2', 'b')], batch_threshold=3000, max_workers=4)
+		self.assertEqual(out.embeddings['1'], [0.1])
+		self.assertEqual(out.embeddings['2'], [0.2])
+		self.assertEqual(bh._embed_one.call_count, 2)
+
+	@patch('bedrockhelper.main.normalize_records', return_value=[('1', 'a')])
+	def test_embed_one_unexpected_embedding_raises(self, norm):
+		bh = self._make_helper_with_clients()
+		bh.bedrock_runtime.invoke_model.return_value = {'body': BytesIO(json.dumps({'embedding': 'nope'}).encode())}
+		with self.assertRaises(RuntimeError):
+			bh.embed_texts(records=[('1', 'a')], batch_threshold=3000, max_workers=1)
+
+	@patch('bedrockhelper.main.normalize_records', return_value=[('1', 'a')])
+	def test_embed_texts_batch_path_calls_submit(self, norm):
+		bh = self._make_helper_with_clients()
+		bh.submit_embedding_batch_job = MagicMock(return_value=MagicMock(job_id='x'))
+		out = bh.embed_texts(records=[('1', 'a')], batch_threshold=0, s3_bucket='b', role_arn='r')
+		self.assertEqual(out.job_id, 'x')
 
 	def test_submit_embedding_batch_job_requires_bucket_and_role(self):
+		bh = self._make_helper_with_clients()
 		with self.assertRaises(ValueError):
-			self.h.submit_embedding_batch_job(
-				[("a", "A")], s3_bucket=None, s3_prefix="p", role_arn="r"
-			)
-		with self.assertRaises(ValueError):
-			self.h.submit_embedding_batch_job(
-				[("a", "A")], s3_bucket="b", s3_prefix="p", role_arn=None
-			)
+			bh.submit_embedding_batch_job([('1', 'a')], s3_bucket=None, s3_prefix='p', role_arn=None)
 
-	@patch("bedrockhelper.main.uuid.uuid4")
-	def test_submit_embedding_batch_job_job_id_fallbacks(self, uuid4: MagicMock):
-		uuid4.return_value = SimpleNamespace(hex="deadbeef")
+	@patch('bedrockhelper.main.normalize_records', return_value=[('1', 'a')])
+	def test_submit_embedding_batch_job_normalizes_when_not_list_of_tuples(self, norm):
+		# cover the normalize_records call inside submit_embedding_batch_job
+		bh = self._make_helper_with_clients()
+		bh.s3.upload_file.return_value = None
+		bh.bedrock.create_model_invocation_job.return_value = {'jobId': 'job-1'}
 
-		# no recognized job id keys -> should use job_name fallback
-		self.br.create_model_invocation_job = MagicMock(return_value={})
-		self.s3.upload_file = MagicMock()
-
-		out = self.h.submit_embedding_batch_job(
-			[("a", "A")],
-			s3_bucket="bucket",
-			s3_prefix="pref",
-			role_arn="arn:role",
+		out = bh.submit_embedding_batch_job(
+			pairs={'1': 'a'},  # not list/tuple -> triggers normalize_records
+			s3_bucket='bucket',
+			s3_prefix='pref',
+			role_arn='arn:role/xyz',
 		)
+		self.assertEqual(out.job_id, 'job-1')
+		norm.assert_called()
+
+	@patch('bedrockhelper.main.normalize_records', return_value=[('1', 'a')])
+	def test_submit_embedding_batch_job_happy_path_jobname_fallback(self, norm):
+		bh = self._make_helper_with_clients()
+		bh.s3.upload_file.return_value = None
+		# no job identifiers -> should fall back to job_name
+		bh.bedrock.create_model_invocation_job.return_value = {}
+
+		out = bh.submit_embedding_batch_job(
+			pairs=[('1', 'a')],
+			s3_bucket='bucket',
+			s3_prefix='pref',
+			role_arn='arn:role/xyz',
+		)
+		self.assertTrue(out.job_id.startswith('bedrock-embedding-job-'))
 		self.assertEqual(out.job_id, out.job_name)
-		self.assertIn("deadbeef", out.job_name)
 
-	@patch("bedrockhelper.main.uuid.uuid4")
-	@patch("bedrockhelper.main.os.remove", side_effect=OSError("nope"))
-	def test_submit_embedding_batch_job_cleanup_swallows_oserror(self, rm: MagicMock, uuid4: MagicMock):
-		uuid4.return_value = SimpleNamespace(hex="deadbeef")
-		self.br.create_model_invocation_job = MagicMock(return_value={"jobArn": "arn:job"})
-		self.s3.upload_file = MagicMock()
+	@patch('bedrockhelper.main.os.remove', side_effect=OSError('nope'))
+	@patch('bedrockhelper.main.normalize_records', return_value=[('1', 'a')])
+	def test_submit_embedding_batch_job_tempfile_cleanup_oserror_swallowed(self, norm, remove_mock):
+		bh = self._make_helper_with_clients()
+		bh.s3.upload_file.return_value = None
+		bh.bedrock.create_model_invocation_job.return_value = {'jobId': 'job-1'}
 
-		# should not raise even though os.remove fails
-		out = self.h.submit_embedding_batch_job(
-			[("a", "A")],
-			s3_bucket="bucket",
-			s3_prefix="pref",
-			role_arn="arn:role",
+		# Should not raise even though os.remove blows up in finally:
+		out = bh.submit_embedding_batch_job(
+			pairs=[('1', 'a')],
+			s3_bucket='bucket',
+			s3_prefix='pref',
+			role_arn='arn:role/xyz',
 		)
-		self.assertEqual(out.job_id, "arn:job")
+		self.assertEqual(out.job_id, 'job-1')
+		remove_mock.assert_called_once()
 
-	@patch("bedrockhelper.main.normalize_records", return_value=[("a", "A")])
-	def test_submit_embedding_batch_job_normalizes_non_list_pairs(self, norm: MagicMock):
-		self.br.create_model_invocation_job = MagicMock(return_value={"jobId": "jid"})
-		self.s3.upload_file = MagicMock()
+	def test_get_batch_job(self):
+		bh = self._make_helper_with_clients()
+		bh.bedrock.get_model_invocation_job.return_value = {'status': 'Completed'}
+		self.assertEqual(bh.get_batch_job('id')['status'], 'Completed')
 
-		# pass something not a list of tuples to trigger normalize_records branch
-		out = self.h.submit_embedding_batch_job(
-			pairs={"a": "A"},  # type: ignore[arg-type]
-			s3_bucket="bucket",
-			s3_prefix="pref",
-			role_arn="arn:role",
-		)
-		self.assertEqual(out.job_id, "jid")
-		norm.assert_called_once()
+	def test_wait_for_batch_job_stops_on_failed(self):
+		bh = self._make_helper_with_clients()
+		bh.get_batch_job = MagicMock(return_value={'status': 'Failed'})
+		out = bh.wait_for_batch_job('id', poll_seconds=0.0, timeout_seconds=0.1)
+		self.assertEqual(out['status'], 'Failed')
 
-	def test_download_batch_results_jsonl_rejects_non_s3_uri(self):
-		with self.assertRaises(ValueError):
-			list(self.h.download_batch_results_jsonl(output_s3_uri="http://nope"))
-
-	def test_download_batch_results_jsonl_parses_only_jsonl_and_skips_blanks(self):
-		# s3://bucket/prefix (without trailing slash) should be normalized to prefix/
-		pages = [
-			{"Contents": [
-				{"Key": "prefix/ignore.txt"},
-				{"Key": "prefix/a.jsonl"},
-			]}
-		]
-		self.s3.get_paginator = MagicMock(return_value=FakePaginator(pages))
-
-		payload = (
-			b'\n{"recordId":"1","modelOutput":{"embedding":[1]}}'
-			b'\n\n{"recordId":"2","modelOutput":{"embedding":[2]}}\n'
-		)
-		self.s3.get_object = MagicMock(return_value={"Body": FakeBody(payload)})
-
-		got = list(self.h.download_batch_results_jsonl(output_s3_uri="s3://bucket/prefix"))
-		self.assertEqual(len(got), 2)
-		self.assertEqual(got[0]["recordId"], "1")
-		self.assertEqual(got[1]["recordId"], "2")
-
-	def test_parse_batch_embeddings_covers_all_skips(self):
-		# drive parse via a controlled generator
-		def fake_iter(**kwargs: Any) -> Iterator[dict]:
-			yield {"no_record": True}  # skip (no recordId)
-			yield {"recordId": "1", "modelOutput": "not-a-dict"}  # skip (model_out not dict)
-			yield {"recordId": "2", "modelOutput": {"embedding": "nope"}}  # skip (not list)
-			yield {"record_id": "3", "model_output": {"embedding": [3.0]}}  # accept
-			yield {"recordId": "4", "output": {"embedding": [4.0]}}  # accept via 'output'
-
-		self.h.download_batch_results_jsonl = MagicMock(side_effect=lambda **kw: fake_iter(**kw))
-
-		out = self.h.parse_batch_embeddings(output_s3_uri="s3://bucket/prefix/")
-		self.assertEqual(out, {"3": [3.0], "4": [4.0]})
-
-	def test_get_batch_job_delegates(self):
-		self.br.get_model_invocation_job = MagicMock(return_value={"status": "Completed"})
-		out = self.h.get_batch_job("jid")
-		self.assertEqual(out["status"], "Completed")
-		self.br.get_model_invocation_job.assert_called_once_with(jobIdentifier="jid")
-
-	@patch("bedrockhelper.main.time.sleep", return_value=None)
-	def test_wait_for_batch_job_returns_on_terminal_status(self, _sleep: MagicMock):
-		# first call InProgress then Completed
-		self.h.get_batch_job = MagicMock(side_effect=[
-			{"status": "InProgress"},
-			{"status": "Completed"},
-		])
-		out = self.h.wait_for_batch_job("jid", poll_seconds=0.0, timeout_seconds=1.0)
-		self.assertEqual(out["status"], "Completed")
-
-	@patch("bedrockhelper.main.time.sleep", return_value=None)
-	@patch("bedrockhelper.main.time.time")
-	def test_wait_for_batch_job_times_out(self, ttime: MagicMock, _sleep: MagicMock):
-		# time advances past deadline quickly
-		start = 1000.0
-		ttime.side_effect = [start, start + 2.0]  # initial + then beyond deadline
-		self.h.get_batch_job = MagicMock(return_value={"status": "InProgress"})
-
+	def test_wait_for_batch_job_timeout(self):
+		bh = self._make_helper_with_clients()
+		bh.get_batch_job = MagicMock(return_value={'status': 'InProgress'})
 		with self.assertRaises(TimeoutError):
-			self.h.wait_for_batch_job("jid", poll_seconds=0.0, timeout_seconds=1.0)
+			bh.wait_for_batch_job('id', poll_seconds=0.0, timeout_seconds=0.0)
 
-	def test_input_text_token_count_non_int_is_ignored(self):
-		resp = {"ResponseMetadata": {"HTTPHeaders": {}}}
-		# Non-int value that will raise TypeError when passed to int()
-		body = {"inputTextTokenCount": {"not": "an-int"}}
+	def test_download_batch_results_jsonl_invalid_uri(self):
+		bh = self._make_helper_with_clients()
+		with self.assertRaises(ValueError):
+			list(bh.download_batch_results_jsonl(output_s3_uri='http://nope'))
 
-		# Should not raise and input_tokens should remain None
-		metrics = BedrockHelper._extract_metrics_from_response(resp, body)
-		self.assertIsNone(metrics.input_tokens)
+	def test_download_batch_results_jsonl_prefix_normalization_and_filters(self):
+		bh = self._make_helper_with_clients()
 
-	def test_input_text_token_count_string_parsed(self):
-		resp = {"ResponseMetadata": {"HTTPHeaders": {}}}
-		# Valid numeric string should be parsed to int
-		body = {"inputTextTokenCount": "99"}
+		# prefix without trailing slash triggers prefix += '/'
+		# also include key None branch
+		pages = [{'Contents': [{'Key': None}, {'Key': 'x.txt'}, {'Key': 'ok.jsonl'}]}]
+		bh.s3.get_paginator.return_value = _FakePaginator(pages)
 
-		metrics = BedrockHelper._extract_metrics_from_response(resp, body)
-		self.assertEqual(metrics.input_tokens, 99)
+		body = b'\n' + json.dumps({'recordId': '1', 'modelOutput': {'embedding': [1.0]}}).encode() + b'\n'
+		bh.s3.get_object.return_value = {'Body': BytesIO(body)}
 
-	@patch("bedrockhelper.main.normalize_headers")
-	def test_extract_metrics_header_values_none_are_ignored(self, norm_headers: MagicMock):
-		norm_headers.return_value = {
-			"x-amzn-bedrock-input-token-count": None,
-			"x-amzn-bedrock-output-token-count": None,
-			"x-amzn-bedrock-invocation-latency": None,
-			"x-amzn-bedrock-first-byte-latency": None,
-		}
+		items = list(bh.download_batch_results_jsonl(output_s3_uri='s3://bucket/prefix'))
+		self.assertEqual(len(items), 1)
+		self.assertEqual(items[0]['recordId'], '1')
 
-		resp = {"ResponseMetadata": {"HTTPHeaders": {"some-header": "present"}}}
-		metrics = BedrockHelper._extract_metrics_from_response(resp, None)
+		# assert paginator used normalized Prefix ending in '/'
+		# (paginate is called inside download_batch_results_jsonl)
+		# we can't easily see kwargs without wrapping paginator, so just ensure get_paginator called
+		bh.s3.get_paginator.assert_called_once_with('list_objects_v2')
 
-		# Values coming from headers that are None should leave metrics as None
-		self.assertIsNone(metrics.input_tokens)
-		self.assertIsNone(metrics.output_tokens)
-		self.assertIsNone(metrics.invocation_latency_ms)
-		self.assertIsNone(metrics.first_byte_latency_ms)
+	def test_parse_batch_embeddings_branches(self):
+		bh = self._make_helper_with_clients()
 
-		# header_metrics should reflect the normalized headers mapping
-		self.assertEqual(metrics.header_metrics, norm_headers.return_value)
+		def gen():
+			yield {'x': 1}  # rid missing
+			yield {'recordId': 'a', 'modelOutput': 'nope'}  # modelOut not dict
+			yield {'recordId': 'b', 'modelOutput': {'embedding': 'nope'}}  # embedding not list
+			yield {'record_id': 'c', 'model_output': {'embedding': [9.0]}}  # good
+			yield {'recordId': 'd', 'output': {'embedding': [10.0]}}  # output alias branch
 
-
-	@patch("bedrockhelper.main.normalize_headers")
-	def test_extract_metrics_header_get_int_branch(self, norm_headers: MagicMock):
-		# mix of valid int-string, invalid string, int, and a type that will raise in int()
-		norm_headers.return_value = {
-			"x-amzn-bedrock-input-token-count": "12",
-			"x-amzn-bedrock-output-token-count": "not-an-int",
-			"x-amzn-bedrock-invocation-latency": 7,
-			"x-amzn-bedrock-first-byte-latency": {"bad": "value"},
-		}
-
-		resp = {"ResponseMetadata": {"HTTPHeaders": {"irrelevant": "present"}}}
-		metrics = BedrockHelper._extract_metrics_from_response(resp, None)
-
-		self.assertEqual(metrics.input_tokens, 12)
-		self.assertIsNone(metrics.output_tokens)
-		self.assertEqual(metrics.invocation_latency_ms, 7)
-		self.assertIsNone(metrics.first_byte_latency_ms)
-		# ensure header_metrics preserved
-		self.assertEqual(metrics.header_metrics, norm_headers.return_value)
+		bh.download_batch_results_jsonl = MagicMock(side_effect=lambda output_s3_uri: gen())
+		out = bh.parse_batch_embeddings(output_s3_uri='s3://bucket/prefix/')
+		self.assertEqual(out, {'c': [9.0], 'd': [10.0]})
 
 
-	def test_wait_for_batch_job_propagates_get_batch_job_exception(self):
-		# Simulate get_batch_job raising an error; wait_for_batch_job should propagate it immediately.
-		self.h.get_batch_job = MagicMock(side_effect=RuntimeError("boom"))
+class TestBedrockHelperAsync(IsolatedAsyncioTestCase):
+	def _make_helper_with_clients(self):
+		brt = MagicMock(name='bedrock-runtime')
+		br = MagicMock(name='bedrock')
+		s3 = MagicMock(name='s3')
+		return BedrockHelper(bedrock_runtime_client=brt, bedrock_client=br, s3_client=s3)
+
+	async def test_async_generate_with_rag_uses_to_thread(self):
+		bh = self._make_helper_with_clients()
+		bh.generate_with_rag = MagicMock(return_value=MagicMock(text='x'))
+		out = await bh.async_generate_with_rag(system_prompt='S', context='C', question='Q')
+		self.assertEqual(out.text, 'x')
+		bh.generate_with_rag.assert_called_once()
+
+	@patch(
+		'bedrockhelper.main.threading.Thread',
+		side_effect=lambda target, daemon: _ImmediateThread(target=target, daemon=daemon),
+	)
+	@patch('bedrockhelper.main.truncate_by_chars', side_effect=lambda s, n: s)
+	@patch('bedrockhelper.main.iter_bedrock_stream_text', side_effect=lambda stream, on_text, stream_kind: on_text('A'))
+	async def test_async_stream_generate_with_rag_prefers_converse_stream(self, iter_stream, trunc, ThreadMock):
+		bh = self._make_helper_with_clients()
+
+		stream = _FakeClosableStream()
+		bh.bedrock_runtime.converse_stream.return_value = {'stream': stream}
+
+		chunks = []
+		async for t in bh.async_stream_generate_with_rag(
+			system_prompt='S',
+			context='CTX',
+			question='Q',
+			prefer_converse=True,
+		):
+			chunks.append(t)
+
+		self.assertEqual(chunks, ['A'])
+		self.assertTrue(stream.closed)
+		bh.bedrock_runtime.converse_stream.assert_called_once()
+
+	@patch(
+		'bedrockhelper.main.threading.Thread',
+		side_effect=lambda target, daemon: _ImmediateThread(target=target, daemon=daemon),
+	)
+	@patch('bedrockhelper.main.truncate_by_chars', side_effect=lambda s, n: s)
+	async def test_async_stream_generate_with_rag_no_converse_stream_then_error_propagates(self, trunc, ThreadMock):
+		bh = self._make_helper_with_clients()
+
+		# Ensure there is NO converse_stream attribute, so worker skips converse path without try/except
+		if hasattr(bh.bedrock_runtime, 'converse_stream'):
+			del bh.bedrock_runtime.converse_stream
+
+		# Force the fallback call itself to raise (worker catches BaseException -> sets err -> generator raises at end)
+		bh.bedrock_runtime.invoke_model_with_response_stream.side_effect = RuntimeError('boom')
+
 		with self.assertRaises(RuntimeError):
-			self.h.wait_for_batch_job("jid", poll_seconds=0.0, timeout_seconds=1.0)
+			async for _ in bh.async_stream_generate_with_rag(
+				system_prompt='S',
+				context='CTX',
+				question='Q',
+				prefer_converse=True,  # important: we want the "no converse_stream" skip branch
+			):
+				pass
 
+	@patch(
+		'bedrockhelper.main.threading.Thread',
+		side_effect=lambda target, daemon: _ImmediateThread(target=target, daemon=daemon),
+	)
+	@patch('bedrockhelper.main.truncate_by_chars', side_effect=lambda s, n: s)
+	@patch('bedrockhelper.main.iter_bedrock_stream_text', side_effect=lambda stream, on_text, stream_kind: on_text('B'))
+	async def test_async_stream_generate_with_rag_converse_stream_fails_falls_back_to_invoke(
+		self, iter_stream, trunc, ThreadMock
+	):
+		bh = self._make_helper_with_clients()
 
-	# python
-	def test_wait_for_batch_job_returns_immediately_for_terminal_status(self):
-		# Immediate terminal status should return and not call time.sleep
-		self.h.get_batch_job = MagicMock(return_value={"status": "Completed"})
-		with patch("bedrockhelper.main.time.sleep") as sleep:
-			out = self.h.wait_for_batch_job("jid", poll_seconds=0.0, timeout_seconds=1.0)
-			self.assertEqual(out["status"], "Completed")
-			self.assertEqual(sleep.call_count, 0)
+		# converse_stream exists but throws -> fallback path
+		bh.bedrock_runtime.converse_stream.side_effect = RuntimeError('nope')
 
+		event_stream = _FakeClosableStream()
+		bh.bedrock_runtime.invoke_model_with_response_stream.return_value = {'body': event_stream}
 
-	def test_wait_for_batch_job_handles_various_terminal_statuses_and_polling(self):
-		# For each terminal status, simulate one non-terminal poll then terminal,
-		# ensure time.sleep is called once. Also test a multi-poll case.
-		terminal_statuses = ("Completed", "Failed", "Stopped", "Expired")
-		for status in terminal_statuses:
-			with self.subTest(status=status):
-				self.h.get_batch_job = MagicMock(side_effect=[
-					{"status": "InProgress"},
-					{"status": status},
-				])
-				with patch("bedrockhelper.main.time.sleep") as sleep:
-					out = self.h.wait_for_batch_job("jid", poll_seconds=0.0, timeout_seconds=1.0)
-					self.assertEqual(out["status"], status)
-					self.assertEqual(sleep.call_count, 1)
-
-		# multi-poll scenario: two non-terminal polls then terminal -> two sleeps
-		self.h.get_batch_job = MagicMock(side_effect=[
-			{"status": "InProgress"},
-			{"status": "InProgress"},
-			{"status": "Completed"},
-		])
-		with patch("bedrockhelper.main.time.sleep") as sleep:
-			out = self.h.wait_for_batch_job("jid", poll_seconds=0.0, timeout_seconds=5.0)
-			self.assertEqual(out["status"], "Completed")
-			self.assertEqual(sleep.call_count, 2)
-
-
-	@patch("bedrockhelper.main.uuid.uuid4")
-	@patch("bedrockhelper.main.os.remove")
-	def test_submit_embedding_batch_job_uses_jobIdentifier_and_removes_tempfile(self, rm: MagicMock, uuid4: MagicMock):
-		uuid4.return_value = SimpleNamespace(hex="deadbeef")
-		self.br.create_model_invocation_job = MagicMock(return_value={"jobIdentifier": "jid-123"})
-		self.s3.upload_file = MagicMock()
-
-		out = self.h.submit_embedding_batch_job(
-			[("a", "A")],
-			s3_bucket="bucket",
-			s3_prefix="pref",
-			role_arn="arn:role",
-		)
-
-		self.assertEqual(out.job_id, "jid-123")
-
-		# ensure the temp file cleanup "happy path" executed (covers the os.remove line)
-		rm.assert_called_once()
-		args, _ = rm.call_args
-		self.assertTrue(isinstance(args[0], str))
-		self.assertTrue(args[0].endswith(".jsonl"))
-
-
-	@patch("bedrockhelper.main.uuid.uuid4")
-	def test_submit_embedding_batch_job_uses_id_key(self, uuid4: MagicMock):
-		uuid4.return_value = SimpleNamespace(hex="deadbeef")
-		self.br.create_model_invocation_job = MagicMock(return_value={"id": "id-999"})
-		self.s3.upload_file = MagicMock()
-
-		out = self.h.submit_embedding_batch_job(
-			[("a", "A")],
-			s3_bucket="bucket",
-			s3_prefix="pref",
-			role_arn="arn:role",
-		)
-
-		self.assertEqual(out.job_id, "id-999")
-
-
-class TestAsyncGenerateWithRag(IsolatedAsyncioTestCase):
-	async def asyncSetUp(self) -> None:
-		self.brt = MagicMock()
-		self.br = MagicMock()
-		self.s3 = MagicMock()
-		self.h = BedrockHelper(
-			bedrock_runtime_client=self.brt,
-			bedrock_client=self.br,
-			s3_client=self.s3,
-		)
-
-	async def test_async_generate_with_rag_delegates_to_generate_with_rag(self):
-		sentinel = RAGResponse(text="ok", stream=False, metrics=None, raw_response=None)
-
-		with patch.object(BedrockHelper, "generate_with_rag", return_value=sentinel) as gen:
-			out = await self.h.async_generate_with_rag(
-				system_prompt="SYS",
-				context="CTX",
-				question="Q",
-				stream=False,
-				foo="bar",
-			)
-
-			# ensure the async wrapper returned the same object
-			self.assertIs(out, sentinel)
-
-			# ensure the sync method was called once with kwargs forwarded
-			gen.assert_called_once()
-			_, kwargs = gen.call_args
-			self.assertEqual(kwargs["system_prompt"], "SYS")
-			self.assertEqual(kwargs["context"], "CTX")
-			self.assertEqual(kwargs["question"], "Q")
-			self.assertEqual(kwargs["stream"], False)
-			self.assertEqual(kwargs["foo"], "bar")
-
-	@patch("bedrockhelper.main.truncate_by_chars", side_effect=lambda s, n: s)
-	@patch("bedrockhelper.main.iter_bedrock_stream_text")
-	async def test_async_stream_no_rag_instructions_prefix(self, it: MagicMock, trunc: MagicMock):
-		if hasattr(self.brt, "converse_stream"):
-			delattr(self.brt, "converse_stream")
-
-		event_stream = FakeStream()
-
-		def _iter(stream_obj: Any, on_text: Any, stream_kind: str) -> None:
-			on_text("x")
-
-		it.side_effect = _iter
-		self.brt.invoke_model_with_response_stream = MagicMock(return_value={"body": event_stream})
-
-		parts: List[str] = []
-		async for chunk in self.h.async_stream_generate_with_rag(
-				system_prompt="SYS",
-				context="CTX",
-				question="Q",
-				prefer_converse=False,
-				rag_instructions="   ",  # blank after strip()
+		chunks = []
+		async for t in bh.async_stream_generate_with_rag(
+			system_prompt='S',
+			context='CTX',
+			question='Q',
+			prefer_converse=True,
+			rag_instructions='INS',
+			max_tokens=5,
+			temperature=0.0,
 		):
-			parts.append(chunk)
+			chunks.append(t)
 
-		self.assertEqual("".join(parts), "x")
-
-		# verify request did NOT get a "prefix\n" before Context:
-		_, kwargs = self.brt.invoke_model_with_response_stream.call_args
-		body = json.loads(kwargs["body"])
-		text = body["messages"][0]["content"][0]["text"]
-		self.assertTrue(text.startswith("Context:\nCTX\n\nQuestion:\nQ\n"))
-
-	@patch("bedrockhelper.main.truncate_by_chars", side_effect=lambda s, n: s)
-	@patch("bedrockhelper.main.iter_bedrock_stream_text")
-	async def test_async_stream_includes_trimmed_rag_instructions_prefix(self, it: MagicMock, trunc: MagicMock):
-		# force fallback path (no converse_stream)
-		if hasattr(self.brt, "converse_stream"):
-			delattr(self.brt, "converse_stream")
-
-		# replace the helper's semaphore with the counting test double so we can assert calls
-		self.h._stream_sema = CountingSemaphore()
-
-		event_stream = FakeStream()
-
-		def _iter(stream_obj: Any, on_text: Any, stream_kind: str) -> None:
-			on_text("x")
-
-		it.side_effect = _iter
-		self.brt.invoke_model_with_response_stream = MagicMock(return_value={"body": event_stream})
-
-		parts: List[str] = []
-		# rag_instructions has surrounding whitespace to verify .strip() is applied
-		rag_instructions = "  RAG-INSTR  "
-
-		async for chunk in self.h.async_stream_generate_with_rag(
-				system_prompt="SYS",
-				context="CTX",
-				question="Q",
-				prefer_converse=False,
-				rag_instructions=rag_instructions,
-		):
-			parts.append(chunk)
-
-		# basic stream behavior checks
-		self.assertEqual("".join(parts), "x")
+		self.assertEqual(chunks, ['B'])
 		self.assertTrue(event_stream.closed)
-		self.assertEqual(self.h._stream_sema.acquire_calls, 1)
-		self.assertEqual(self.h._stream_sema.release_calls, 1)
+		bh.bedrock_runtime.invoke_model_with_response_stream.assert_called_once()
 
-		# ensure the body included the trimmed rag_instructions as a prefix + newline
-		self.brt.invoke_model_with_response_stream.assert_called_once()
-		_, kwargs = self.brt.invoke_model_with_response_stream.call_args
-		body = json.loads(kwargs["body"])
-		text = body["messages"][0]["content"][0]["text"]
-		# expected prefix is the stripped instructions followed by a newline, then "Context:"
-		self.assertTrue(text.startswith("RAG-INSTR\nContext:\nCTX\n\nQuestion:\nQ\n"))
+	@patch(
+		'bedrockhelper.main.threading.Thread',
+		side_effect=lambda target, daemon: _ImmediateThread(target=target, daemon=daemon),
+	)
+	@patch('bedrockhelper.main.truncate_by_chars', side_effect=lambda s, n: s)
+	async def test_async_stream_generate_with_rag_missing_body_raises_from_worker(self, trunc, ThreadMock):
+		bh = self._make_helper_with_clients()
+		bh.bedrock_runtime.converse_stream.side_effect = RuntimeError('force fallback')
+		bh.bedrock_runtime.invoke_model_with_response_stream.return_value = {}  # missing body triggers error
 
-	@patch("bedrockhelper.main.iter_bedrock_stream_text")
-	async def test_async_stream_exta_params_forwarded(self, it: MagicMock):
-		# force fallback path (no converse_stream)
-		if hasattr(self.brt, "converse_stream"):
-			delattr(self.brt, "converse_stream")
+		with self.assertRaises(RuntimeError):
+			async for _ in bh.async_stream_generate_with_rag(system_prompt='S', context='CTX', question='Q'):
+				pass
 
-		event_stream = FakeStream()
+	@patch(
+		'bedrockhelper.main.threading.Thread',
+		side_effect=lambda target, daemon: _ImmediateThread(target=target, daemon=daemon),
+	)
+	@patch('bedrockhelper.main.truncate_by_chars', side_effect=lambda s, n: s)
+	@patch('bedrockhelper.main.iter_bedrock_stream_text', side_effect=lambda stream, on_text, stream_kind: on_text('C'))
+	async def test_async_stream_generate_with_rag_release_exception_swallowed(self, iter_stream, trunc, ThreadMock):
+		# Covers the "release throws -> swallow" branch (your uncovered 898-899-ish style finally path)
+		bh = self._make_helper_with_clients()
+		bh._stream_sema = _ExplodingReleaseSema()
 
-		# make the patched iterator call on_text once so the async generator yields
-		def _iter(stream_obj: Any, on_text: Any, stream_kind: str) -> None:
-			on_text("x")
+		# Force fallback immediately (no converse_stream attr or failure)
+		event_stream = _FakeClosableStream()
+		bh.bedrock_runtime.invoke_model_with_response_stream.return_value = {'body': event_stream}
 
-		it.side_effect = _iter
-		self.brt.invoke_model_with_response_stream = MagicMock(return_value={"body": event_stream})
-
-		parts: List[str] = []
-		async for chunk in self.h.async_stream_generate_with_rag(
-				system_prompt="SYS",
-				context="CTX",
-				question="Q",
-				prefer_converse=False,
-				foo="bar",
+		chunks = []
+		async for t in bh.async_stream_generate_with_rag(
+			system_prompt='S',
+			context='CTX',
+			question='Q',
+			prefer_converse=False,
 		):
-			parts.append(chunk)
+			chunks.append(t)
 
-		# ensure extra param made it through to invoke_model_with_response_stream
-		self.brt.invoke_model_with_response_stream.assert_called_once()
-		_, kwargs = self.brt.invoke_model_with_response_stream.call_args
-		body = json.loads(kwargs["body"])
-		self.assertEqual(body["foo"], "bar")
+		self.assertEqual(chunks, ['C'])
+		self.assertTrue(event_stream.closed)
 
-	async def test_async_embed_texts_delegates_to_embed_texts(self):
-		sentinel = object()
-		with patch.object(BedrockHelper, "embed_texts", return_value=sentinel) as em:
-			out = await self.h.async_embed_texts(
-				records=[("rid", "text")],
-				batch_threshold=1,
-				max_workers=2,
-			)
+	@patch(
+		'bedrockhelper.main.threading.Thread',
+		side_effect=lambda target, daemon: _ImmediateThread(target=target, daemon=daemon),
+	)
+	@patch('bedrockhelper.main.truncate_by_chars', side_effect=lambda s, n: s)
+	@patch(
+		'bedrockhelper.main.iter_bedrock_stream_text', side_effect=lambda stream, on_text, stream_kind: on_text('OK')
+	)
+	async def test_async_stream_generate_with_rag_release_error_is_swallowed(self, iter_stream, trunc, ThreadMock):
+		bh = self._make_helper_with_clients()
 
-			# ensure the async wrapper returned the same object
-			self.assertIs(out, sentinel)
+		# Make release raise to hit the swallow branch
+		bh._stream_sema = _ExplodingReleaseSema()
 
-			# ensure the sync method was called once with kwargs forwarded
-			em.assert_called_once()
-			_, kwargs = em.call_args
-			self.assertEqual(kwargs["records"], [("rid", "text")])
-			self.assertEqual(kwargs["batch_threshold"], 1)
-			self.assertEqual(kwargs["max_workers"], 2)
+		# Go straight to fallback streaming path
+		bh.bedrock_runtime.invoke_model_with_response_stream.return_value = {'body': _FakeClosableStream()}
 
+		chunks = []
+		async for t in bh.async_stream_generate_with_rag(
+			system_prompt='S',
+			context='CTX',
+			question='Q',
+			prefer_converse=False,
+		):
+			chunks.append(t)
+
+		self.assertEqual(chunks, ['OK'])

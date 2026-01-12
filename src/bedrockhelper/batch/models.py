@@ -12,6 +12,7 @@ class BatchJobRef:
 
 	Intentionally excludes large/unstable provider payloads.
 	"""
+
 	job_id: str
 	job_name: str
 	model_id: str
@@ -26,6 +27,7 @@ class StoredBatchJob:
 
 	`job` is the minimal durable reference; store/reconciler owns `state`.
 	"""
+
 	job: BatchJobRef
 	state: str  # "SUBMITTED" | "RUNNING" | "COMPLETED" | "FAILED" | "PROCESSED"
 	created_at: datetime

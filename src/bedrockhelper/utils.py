@@ -4,18 +4,18 @@ from typing import Mapping, Dict, List, Sequence, Any, Callable, Iterable, Optio
 from bedrockhelper.types import RecordInput
 
 
-DEFAULT_STOP_TYPES_INVOKE: Tuple[str, ...] = ("message_stop", "completion_stop", "end")
-DEFAULT_STOP_KEYS_CONVERSE: Tuple[str, ...] = ("messageStop", "message_stop", "stop", "end")
+DEFAULT_STOP_TYPES_INVOKE: Tuple[str, ...] = ('message_stop', 'completion_stop', 'end')
+DEFAULT_STOP_KEYS_CONVERSE: Tuple[str, ...] = ('messageStop', 'message_stop', 'stop', 'end')
 
 
 def iter_bedrock_stream_text(
-		event_stream: Iterable[dict],
-		*,
-		on_text: Callable[[str], None],
-		stream_kind: str = "auto",
-		invoke_stop_types: Tuple[str, ...] = DEFAULT_STOP_TYPES_INVOKE,
-		converse_stop_keys: Tuple[str, ...] = DEFAULT_STOP_KEYS_CONVERSE,
-		decode: str = "utf-8",
+	event_stream: Iterable[dict],
+	*,
+	on_text: Callable[[str], None],
+	stream_kind: str = 'auto',
+	invoke_stop_types: Tuple[str, ...] = DEFAULT_STOP_TYPES_INVOKE,
+	converse_stop_keys: Tuple[str, ...] = DEFAULT_STOP_KEYS_CONVERSE,
+	decode: str = 'utf-8',
 ) -> None:
 	"""
 	Iterate a Bedrock streaming event stream and call `on_text(...)` for each text delta.
@@ -25,11 +25,11 @@ def iter_bedrock_stream_text(
 
 	def _handle_invoke_event(event: dict) -> bool:
 		# Returns True if should stop
-		chunk = event.get("chunk")
+		chunk = event.get('chunk')
 		if not chunk:
 			return False
 
-		raw = chunk.get("bytes")
+		raw = chunk.get('bytes')
 		if not raw:
 			return False
 
@@ -38,23 +38,23 @@ def iter_bedrock_stream_text(
 		except Exception:
 			return False
 
-		delta = msg.get("delta")
+		delta = msg.get('delta')
 		if isinstance(delta, dict):
-			t = delta.get("text")
+			t = delta.get('text')
 			if isinstance(t, str) and t:
 				on_text(t)
 
-		if msg.get("type") in invoke_stop_types:
+		if msg.get('type') in invoke_stop_types:
 			return True
 		return False
 
 	def _handle_converse_event(event: dict) -> bool:
 		# Returns True if should stop
-		cbd = event.get("contentBlockDelta") or event.get("content_block_delta")
+		cbd = event.get('contentBlockDelta') or event.get('content_block_delta')
 		if isinstance(cbd, dict):
-			delta = cbd.get("delta")
+			delta = cbd.get('delta')
 			if isinstance(delta, dict):
-				t = delta.get("text")
+				t = delta.get('text')
 				if isinstance(t, str) and t:
 					on_text(t)
 
@@ -62,7 +62,7 @@ def iter_bedrock_stream_text(
 			if k in event and event.get(k):
 				return True
 
-		ms = event.get("messageStop") or event.get("message_stop")
+		ms = event.get('messageStop') or event.get('message_stop')
 		if isinstance(ms, dict) and ms:
 			return True
 
@@ -74,14 +74,14 @@ def iter_bedrock_stream_text(
 
 		kind = stream_kind
 
-		if kind == "auto":
+		if kind == 'auto':
 			# Prefer converse when a converse-like shape or stop key is present.
 			has_converse = False
 			if (
-					"contentBlockDelta" in event_item
-					or "content_block_delta" in event_item
-					or "messageStop" in event_item
-					or "message_stop" in event_item
+				'contentBlockDelta' in event_item
+				or 'content_block_delta' in event_item
+				or 'messageStop' in event_item
+				or 'message_stop' in event_item
 			):
 				has_converse = True
 			else:
@@ -98,13 +98,13 @@ def iter_bedrock_stream_text(
 				continue
 
 			# If no converse signal, but a chunk is present, treat as invoke.
-			if "chunk" in event_item:
-				kind = "invoke"
+			if 'chunk' in event_item:
+				kind = 'invoke'
 			else:
 				# nothing recognizable in auto mode; skip
 				continue
 
-		if kind == "invoke":
+		if kind == 'invoke':
 			should_stop = _handle_invoke_event(event_item)
 			if should_stop:
 				break
@@ -161,51 +161,53 @@ def normalize_records(records: RecordInput) -> List[Tuple[str, str]]:
 		raise ValueError(f'Unsupported record item type: {type(item)}')
 	return out
 
+
 def extract_converse_text(resp: dict) -> str:
 	"""
 	Extract final assistant text from a Bedrock converse() response.
 	"""
 	try:
-		content = resp.get("output", {}).get("message", {}).get("content", [])
+		content = resp.get('output', {}).get('message', {}).get('content', [])
 		parts: List[str] = []
 		for item in content:
 			if isinstance(item, dict):
-				t = item.get("text")
+				t = item.get('text')
 				if isinstance(t, str):
 					parts.append(t)
-		return "".join(parts)
+		return ''.join(parts)
 	except Exception:
-		return ""
+		return ''
+
 
 def build_converse_request(
-		model_id: str,
-		system_prompt: str,
-		context: str,
-		question: str,
-		max_tokens: int,
-		temperature: float,
-		rag_instructions: str = "",
-		**extra_params: Any,
+	model_id: str,
+	system_prompt: str,
+	context: str,
+	question: str,
+	max_tokens: int,
+	temperature: float,
+	rag_instructions: str = '',
+	**extra_params: Any,
 ) -> Dict[str, Any]:
 	"""
 	Build the shared request payload for converse() and converse_stream().
 	"""
-	user_text = f"Context:\n{context}\n\nQuestion:\n{question}\n"
+	user_text = f'Context:\n{context}\n\nQuestion:\n{question}\n'
 	if rag_instructions:
-		user_text = f"{rag_instructions}\n{user_text}"
+		user_text = f'{rag_instructions}\n{user_text}'
 
 	req: Dict[str, Any] = {
-		"modelId": model_id,
-		"system": [{"text": system_prompt}],
-		"messages": [
+		'modelId': model_id,
+		'system': [{'text': system_prompt}],
+		'messages': [
 			{
-				"role": "user",
-				"content": [{"text": user_text}],
+				'role': 'user',
+				'content': [{'text': user_text}],
 			}
 		],
-		"inferenceConfig": {
-			"maxTokens": max_tokens,
-			"temperature": temperature,
+		'inferenceConfig': {
+			'maxTokens': max_tokens,
+			'temperature': temperature,
 		},
 	}
 
@@ -215,4 +217,3 @@ def build_converse_request(
 		req.update(extra_params)
 
 	return req
-

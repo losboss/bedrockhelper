@@ -17,11 +17,9 @@ class JobStore(Protocol):
 	The default store shipped by this library is in-memory.
 	"""
 
-	def add(self, job: BatchJobResponse) -> None:
-		...
+	def add(self, job: BatchJobResponse) -> None: ...
 
-	def get(self, job_id: str) -> Optional[StoredBatchJob]:
-		...
+	def get(self, job_id: str) -> Optional[StoredBatchJob]: ...
 
 	def upsert(self, job: BatchJobResponse) -> None:
 		"""
@@ -40,29 +38,26 @@ class JobStore(Protocol):
 		"""
 		...
 
-	def list_unfinished_jobs(self, *, limit: int) -> List[StoredBatchJob]:
-		...
+	def list_unfinished_jobs(self, *, limit: int) -> List[StoredBatchJob]: ...
 
 	def mark_checked(
-			self,
-			job_id: str,
-			*,
-			state: Optional[str] = None,
-			last_checked_at: Optional[datetime] = None,
-			attempts: Optional[int] = None,
-			last_error: Optional[str] = None,
-			bedrock_status: Optional[str] = None,
-	) -> None:
-		...
+		self,
+		job_id: str,
+		*,
+		state: Optional[str] = None,
+		last_checked_at: Optional[datetime] = None,
+		attempts: Optional[int] = None,
+		last_error: Optional[str] = None,
+		bedrock_status: Optional[str] = None,
+	) -> None: ...
 
 	def mark_processed(
-			self,
-			job_id: str,
-			*,
-			processed_at: datetime,
-			embeddings_count: int,
-	) -> None:
-		...
+		self,
+		job_id: str,
+		*,
+		processed_at: datetime,
+		embeddings_count: int,
+	) -> None: ...
 
 	def cleanup(self) -> int:
 		"""
@@ -87,15 +82,15 @@ class InMemoryJobStore(JobStore):
 	"""
 
 	def __init__(
-			self,
-			*,
-			max_jobs: int = 10_000,
-			terminal_ttl_seconds: float = 6 * 3600,  # keep terminal jobs for 6h by default
+		self,
+		*,
+		max_jobs: int = 10_000,
+		terminal_ttl_seconds: float = 6 * 3600,  # keep terminal jobs for 6h by default
 	) -> None:
 		if max_jobs < 1:
-			raise ValueError("max_jobs must be >= 1")
+			raise ValueError('max_jobs must be >= 1')
 		if terminal_ttl_seconds <= 0:
-			raise ValueError("terminal_ttl_seconds must be > 0")
+			raise ValueError('terminal_ttl_seconds must be > 0')
 
 		self._max_jobs = max_jobs
 		self._terminal_ttl_seconds = terminal_ttl_seconds
@@ -116,7 +111,7 @@ class InMemoryJobStore(JobStore):
 
 			self._jobs[job_ref.job_id] = StoredBatchJob(
 				job=job_ref,
-				state="SUBMITTED",
+				state='SUBMITTED',
 				created_at=now,
 			)
 
@@ -135,7 +130,7 @@ class InMemoryJobStore(JobStore):
 					self._evict_one_locked()
 				self._jobs[job_ref.job_id] = StoredBatchJob(
 					job=job_ref,
-					state="SUBMITTED",
+					state='SUBMITTED',
 					created_at=now,
 				)
 				return
@@ -162,22 +157,19 @@ class InMemoryJobStore(JobStore):
 			return []
 		with self._lock:
 			# Oldest first gives fair progress; prefer non-terminal states
-			unfinished = [
-				j for j in self._jobs.values()
-				if j.state not in ("FAILED", "PROCESSED")
-			]
+			unfinished = [j for j in self._jobs.values() if j.state not in ('FAILED', 'PROCESSED')]
 			unfinished.sort(key=lambda j: j.created_at)
 			return unfinished[:limit]
 
 	def mark_checked(
-			self,
-			job_id: str,
-			*,
-			state: Optional[str] = None,
-			last_checked_at: Optional[datetime] = None,
-			attempts: Optional[int] = None,
-			last_error: Optional[str] = None,
-			bedrock_status: Optional[str] = None,
+		self,
+		job_id: str,
+		*,
+		state: Optional[str] = None,
+		last_checked_at: Optional[datetime] = None,
+		attempts: Optional[int] = None,
+		last_error: Optional[str] = None,
+		bedrock_status: Optional[str] = None,
 	) -> None:
 		with self._lock:
 			cur = self._jobs.get(job_id)
@@ -197,11 +189,11 @@ class InMemoryJobStore(JobStore):
 			)
 
 	def mark_processed(
-			self,
-			job_id: str,
-			*,
-			processed_at: datetime,
-			embeddings_count: int,
+		self,
+		job_id: str,
+		*,
+		processed_at: datetime,
+		embeddings_count: int,
 	) -> None:
 		with self._lock:
 			cur = self._jobs.get(job_id)
@@ -210,7 +202,7 @@ class InMemoryJobStore(JobStore):
 
 			self._jobs[job_id] = StoredBatchJob(
 				job=cur.job,
-				state="PROCESSED",
+				state='PROCESSED',
 				created_at=cur.created_at,
 				last_checked_at=cur.last_checked_at,
 				attempts=cur.attempts,
@@ -229,7 +221,7 @@ class InMemoryJobStore(JobStore):
 		with self._lock:
 			to_delete: List[str] = []
 			for job_id, stored in self._jobs.items():
-				if stored.state not in ("FAILED", "PROCESSED"):
+				if stored.state not in ('FAILED', 'PROCESSED'):
 					continue
 
 				anchor = stored.processed_at or stored.last_checked_at or stored.created_at
@@ -251,7 +243,7 @@ class InMemoryJobStore(JobStore):
 		Prefer evicting the oldest terminal job; otherwise evict oldest overall.
 		"""
 		# Prefer terminal eviction
-		terminal = [j for j in self._jobs.values() if j.state in ("FAILED", "PROCESSED")]
+		terminal = [j for j in self._jobs.values() if j.state in ('FAILED', 'PROCESSED')]
 		if terminal:
 			terminal.sort(key=lambda j: j.created_at)
 			del self._jobs[terminal[0].job.job_id]

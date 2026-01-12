@@ -1,9 +1,9 @@
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Union, Any
 
-_TERMINAL_STATUSES = {"Completed", "Failed", "Stopped", "Expired"}
-_SUCCESS_STATUSES = {"Completed"}
-_FAILURE_STATUSES = {"Failed", "Stopped", "Expired"}
+_TERMINAL_STATUSES = {'Completed', 'Failed', 'Stopped', 'Expired'}
+_SUCCESS_STATUSES = {'Completed'}
+_FAILURE_STATUSES = {'Failed', 'Stopped', 'Expired'}
 
 
 @dataclass
@@ -48,7 +48,7 @@ class EmbeddingResponse:
 @dataclass(frozen=True, slots=True)
 class BatchJobResponse:
 	job_id: str  # IMPORTANT: should be the real Bedrock identifier
-	job_name: str # User-defined name
+	job_name: str  # User-defined name
 	model_id: str
 	input_s3_uri: str
 	output_s3_uri: str
@@ -56,7 +56,7 @@ class BatchJobResponse:
 
 	@staticmethod
 	def status(info: Dict[str, Any]) -> Optional[str]:
-		s = info.get("status")
+		s = info.get('status')
 		return s if isinstance(s, str) else None
 
 	@staticmethod
@@ -81,12 +81,12 @@ class BatchJobResponse:
 		Bedrock payload shapes can vary, so we probe a few common keys.
 		"""
 		for key_path in (
-				("failureMessage",),
-				("message",),
-				("errorMessage",),
-				("error", "message"),
-				("failureDetails", "message"),
-				("failureReason",),
+			('failureMessage',),
+			('message',),
+			('errorMessage',),
+			('error', 'message'),
+			('failureDetails', 'message'),
+			('failureReason',),
 		):
 			cur: Any = info
 			ok = True
@@ -101,12 +101,13 @@ class BatchJobResponse:
 
 	@staticmethod
 	def summary(info: Dict[str, Any]) -> str:
-		s = BatchJobResponse.status(info) or "Unknown"
+		s = BatchJobResponse.status(info) or 'Unknown'
 		reason = BatchJobResponse.failure_reason(info)
-		return f"{s}" + (f": {reason}" if reason else "")
+		return f'{s}' + (f': {reason}' if reason else '')
 
-	def to_ref(self) -> "BatchJobRef":
+	def to_ref(self) -> 'BatchJobRef':
 		from bedrockhelper.batch.models import BatchJobRef
+
 		return BatchJobRef(
 			job_id=self.job_id,
 			job_name=self.job_name,

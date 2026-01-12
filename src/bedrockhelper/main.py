@@ -19,21 +19,15 @@ Note:
 """
 
 from __future__ import annotations
-import time
+
 import asyncio
 import json
 import logging
 import os
 import tempfile
 import threading
+import time
 import uuid
-from bedrockhelper.models import (
-	InvocationMetrics,
-	RAGResponse,
-	EmbeddingResponse,
-	BatchJobResponse,
-)
-
 from typing import (
 	Any,
 	AsyncIterator,
@@ -48,11 +42,141 @@ from typing import (
 
 import boto3
 from botocore.config import Config
+from botocore.credentials import AssumeRoleCredentialFetcher, DeferredRefreshableCredentials
+from botocore.exceptions import ClientError
+from botocore.session import Session as BotocoreSession
 
-from bedrockhelper.utils import normalize_records, truncate_by_chars, format_context_passages, normalize_headers, \
-	iter_bedrock_stream_text, extract_converse_text, build_converse_request
+from bedrockhelper.models import (
+	BatchJobResponse,
+	EmbeddingResponse,
+	InvocationMetrics,
+	RAGResponse,
+)
+from bedrockhelper.utils import (
+	build_converse_request,
+	extract_converse_text,
+	format_context_passages,
+	iter_bedrock_stream_text,
+	normalize_headers,
+	normalize_records,
+	truncate_by_chars,
+)
+
 from .types import RecordInput
+
 log = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------------------------------
+# Refreshable session + client factory (supports optional STS AssumeRole with auto-refresh)
+# --------------------------------------------------------------------------------------
+
+
+class _BotoSessionManager:
+	"""
+	Thread-safe manager that provides boto3 clients using:
+	  - Default AWS credential resolution (auto-refresh when supported), OR
+	  - Refreshable AssumeRole credentials (botocore DeferredRefreshableCredentials)
+
+	Also supports invalidation to rebuild session/clients on ExpiredToken errors.
+	"""
+
+	def __init__(
+		self,
+		*,
+		region_name: str,
+		botocore_config: Config,
+		role_arn: Optional[str] = None,
+		role_session_name: str = 'bedrockhelper',
+		external_id: Optional[str] = None,
+		sts_region_name: Optional[str] = None,
+		assume_role_duration_seconds: int = 3600,
+	) -> None:
+		self._region = region_name
+		self._cfg = botocore_config
+		self._role_arn = role_arn
+		self._role_session_name = role_session_name
+		self._external_id = external_id
+		self._sts_region = sts_region_name or region_name
+		self._duration = int(assume_role_duration_seconds) if assume_role_duration_seconds else 3600
+
+		self._lock = threading.RLock()
+		self._boto3_session: Optional[boto3.Session] = None
+		self._clients: Dict[str, Any] = {}
+
+	def invalidate(self) -> None:
+		with self._lock:
+			self._boto3_session = None
+			self._clients.clear()
+
+	def _build_boto3_session(self) -> boto3.Session:
+		# No explicit role -> rely on normal resolution (IMDS/IRSA/ECS/SSO/etc). Refresh handled by botocore.
+		if not self._role_arn:
+			return boto3.Session(region_name=self._region)
+
+		# Build botocore session with refreshable assume-role credentials.
+		bc = BotocoreSession()
+		bc.set_config_variable('region', self._region)
+
+		# Ensure source credentials are loaded (refreshable if the provider supports it).
+		source_creds = bc.get_credentials()
+		if source_creds is None:
+			# This mirrors boto3 behavior; raise a helpful error early.
+			raise RuntimeError('Unable to resolve AWS source credentials for AssumeRole')
+
+		# STS client created from a standard boto3 session using source creds.
+		sts = boto3.Session(region_name=self._sts_region).client('sts', config=self._cfg)
+
+		extra_args: Dict[str, Any] = {'RoleSessionName': self._role_session_name}
+		if self._external_id:
+			extra_args['ExternalId'] = self._external_id
+		if self._duration:
+			extra_args['DurationSeconds'] = self._duration
+
+		fetcher = AssumeRoleCredentialFetcher(
+			client_creator=lambda service_name, region_name, **kwargs: sts,
+			source_credentials=source_creds,
+			role_arn=self._role_arn,
+			extra_args=extra_args,
+		)
+
+		refreshable = DeferredRefreshableCredentials(
+			method='assume-role',
+			refresh_using=fetcher.fetch_credentials,
+		)
+
+		# Attach refreshable creds to botocore session.
+		bc._credentials = refreshable  # noqa: SLF001
+		bc.set_credentials(refreshable.access_key, refreshable.secret_key, refreshable.token)
+
+		return boto3.Session(botocore_session=bc, region_name=self._region)
+
+	def _ensure_session(self) -> boto3.Session:
+		with self._lock:
+			if self._boto3_session is None:
+				self._boto3_session = self._build_boto3_session()
+				self._clients.clear()
+			return self._boto3_session
+
+	def client(self, service_name: str) -> Any:
+		with self._lock:
+			sess = self._ensure_session()
+			if service_name not in self._clients:
+				self._clients[service_name] = sess.client(service_name, config=self._cfg)
+			return self._clients[service_name]
+
+
+def _is_expired_token(err: BaseException) -> bool:
+	if isinstance(err, ClientError):
+		code = (err.response.get('Error') or {}).get('Code')
+		return code in {
+			'ExpiredToken',
+			'ExpiredTokenException',
+			'InvalidClientTokenId',
+			'UnrecognizedClientException',
+			'RequestExpired',
+		}
+	return False
 
 
 class BedrockHelper:
@@ -65,31 +189,46 @@ class BedrockHelper:
 	Parameters
 	----------
 	region_name:
-		AWS region for Bedrock. Defaults to ca-central-1
+	        AWS region for Bedrock. Defaults to ca-central-1
 	rag_model_id:
-		Default model id for RAG chat (Claude, etc.). Defaults to Claude Sonnet 4.5
+	        Default model id for RAG chat (Claude, etc.). Defaults to Claude Sonnet 4.5
 	embedding_model_id:
-		Default model id for embeddings. Defaults to Titan v2
+	        Default model id for embeddings. Defaults to Titan v2
 	botocore_config:
-		Optional botocore Config for retries/timeouts.
+	        Optional botocore Config for retries/timeouts.
+	role_arn / role_session_name / external_id / assume_role_duration_seconds:
+	        Optional: assume role (refreshable).
 	s3_client, bedrock_runtime_client, bedrock_client:
-		Optional preconfigured clients (for testing/custom endpoints).
+	        Optional preconfigured clients (for testing/custom endpoints).
 	"""
 
 	def __init__(
-			self,
-			region_name: str = os.getenv('AWS_REGION', 'ca-central-1'),
-			rag_model_id: str = os.getenv('AWS_MODEL_ID', 'global.anthropic.claude-sonnet-4-5-20250929-v1:0'),
-			embedding_model_id: str = os.getenv('AWS_EMBEDDING_MODEL_ID', 'amazon.titan-embed-text-v2:0'),
-			*,
-			botocore_config: Optional[Config] = None,
-			s3_client: Optional[Any] = None,
-			bedrock_runtime_client: Optional[Any] = None,
-			bedrock_client: Optional[Any] = None,
-			max_concurrent_streams: int = 8,
+		self,
+		region_name: str = os.getenv('AWS_REGION', 'ca-central-1'),
+		rag_model_id: str = os.getenv(
+			'AWS_MODEL_ID',
+			'global.anthropic.claude-sonnet-4-5-20250929-v1:0',
+		),
+		embedding_model_id: str = os.getenv(
+			'AWS_EMBEDDING_MODEL_ID',
+			'amazon.titan-embed-text-v2:0',
+		),
+		*,
+		botocore_config: Optional[Config] = None,
+		# assume role (optional)
+		role_arn: Optional[str] = os.getenv('AWS_ROLE_ARN'),
+		role_session_name: str = os.getenv('AWS_ROLE_SESSION_NAME', 'bedrockhelper'),
+		external_id: Optional[str] = os.getenv('AWS_EXTERNAL_ID'),
+		assume_role_duration_seconds: int = int(os.getenv('AWS_ASSUME_ROLE_DURATION', '3600')),
+		# injected clients (tests)
+		s3_client: Optional[Any] = None,
+		bedrock_runtime_client: Optional[Any] = None,
+		bedrock_client: Optional[Any] = None,
+		# streaming
+		max_concurrent_streams: int = 8,
 	) -> None:
 		if max_concurrent_streams < 1:
-			raise ValueError("max_concurrent_streams must be >= 1")
+			raise ValueError('max_concurrent_streams must be >= 1')
 
 		self._max_concurrent_streams = max_concurrent_streams
 		self._stream_sema = threading.BoundedSemaphore(max_concurrent_streams)
@@ -102,24 +241,48 @@ class BedrockHelper:
 				read_timeout=120,
 			)
 
-		self.bedrock_runtime = bedrock_runtime_client or boto3.client(
-			'bedrock-runtime',
+		self._session_mgr = _BotoSessionManager(
 			region_name=region_name,
-			config=botocore_config,
+			botocore_config=botocore_config,
+			role_arn=role_arn,
+			role_session_name=role_session_name,
+			external_id=external_id,
+			assume_role_duration_seconds=assume_role_duration_seconds,
 		)
-		self.bedrock = bedrock_client or boto3.client(
-			'bedrock',
-			region_name=region_name,
-			config=botocore_config,
-		)
-		self.s3 = s3_client or boto3.client(
-			's3',
-			region_name=region_name,
-			config=botocore_config,
-		)
+
+		# Track which clients were injected; we won't overwrite them on refresh.
+		self._injected = {
+			'bedrock_runtime': bedrock_runtime_client is not None,
+			'bedrock': bedrock_client is not None,
+			's3': s3_client is not None,
+		}
+
+		self.bedrock_runtime = bedrock_runtime_client or self._session_mgr.client('bedrock-runtime')
+		self.bedrock = bedrock_client or self._session_mgr.client('bedrock')
+		self.s3 = s3_client or self._session_mgr.client('s3')
 
 		self.rag_model_id = rag_model_id
 		self.embedding_model_id = embedding_model_id
+
+	def _refresh_clients_if_needed(self) -> None:
+		# Rebind only non-injected clients.
+		if not self._injected['bedrock_runtime']:
+			self.bedrock_runtime = self._session_mgr.client('bedrock-runtime')
+		if not self._injected['bedrock']:
+			self.bedrock = self._session_mgr.client('bedrock')
+		if not self._injected['s3']:
+			self.s3 = self._session_mgr.client('s3')
+
+	def _call_with_refresh(self, fn, *args, **kwargs):
+		try:
+			return fn(*args, **kwargs)
+		except BaseException as e:
+			if not _is_expired_token(e):
+				raise
+			# Invalidate session+clients and retry once.
+			self._session_mgr.invalidate()
+			self._refresh_clients_if_needed()
+			return fn(*args, **kwargs)
 
 	# ------------------------------------------------------------------
 	# Metrics helpers
@@ -127,9 +290,9 @@ class BedrockHelper:
 
 	@classmethod
 	def _extract_metrics_from_response(
-			cls,
-			response: dict,
-			response_body: Optional[dict] = None,
+		cls,
+		response: dict,
+		response_body: Optional[dict] = None,
 	) -> InvocationMetrics:
 		metrics = InvocationMetrics()
 
@@ -213,33 +376,21 @@ class BedrockHelper:
 	# ------------------------------------------------------------------
 
 	def generate_with_rag(
-			self,
-			*,
-			system_prompt: str,
-			context: Union[str, Sequence[str]],
-			include_headers_in_context: bool = False,
-			question: str,
-			model_id: Optional[str] = None,
-			stream: bool = False,
-			temperature: float = 0.1,
-			max_tokens: int = 1024,
-			max_context_chars: Optional[int] = 120_000,
-			prefer_converse: bool = True,
-			rag_instructions: str = '',
-			**extra_params: Any,
+		self,
+		*,
+		system_prompt: str,
+		context: Union[str, Sequence[str]],
+		include_headers_in_context: bool = False,
+		question: str,
+		model_id: Optional[str] = None,
+		stream: bool = False,
+		temperature: float = 0.1,
+		max_tokens: int = 1024,
+		max_context_chars: Optional[int] = 120_000,
+		prefer_converse: bool = True,
+		rag_instructions: str = '',
+		**extra_params: Any,
 	) -> RAGResponse:
-		"""
-		Run a RAG-style Q&A call.
-
-		Default behavior:
-		- If prefer_converse=True and the boto3 client exposes converse/converse_stream,
-		  we use it first.
-		- If it errors (or isn't present), we fall back to Claude message format via
-		  invoke_model/invoke_model_with_response_stream.
-
-		Returns:
-			RAGResponse(text, stream, metrics, raw_response)
-		"""
 		selected_model = model_id or self.rag_model_id
 
 		if isinstance(context, str):
@@ -263,20 +414,17 @@ class BedrockHelper:
 						rag_instructions=rag_instructions,
 						**extra_params,
 					)
-				else:
-					return self._generate_with_converse(
-						model_id=selected_model,
-						system_prompt=system_prompt,
-						context=ctx,
-						question=question,
-						max_tokens=max_tokens,
-						temperature=temperature,
-						rag_instructions=rag_instructions,
-						**extra_params,
-					)
+				return self._generate_with_converse(
+					model_id=selected_model,
+					system_prompt=system_prompt,
+					context=ctx,
+					question=question,
+					max_tokens=max_tokens,
+					temperature=temperature,
+					rag_instructions=rag_instructions,
+					**extra_params,
+				)
 			except Exception:
-				# Converse sometimes fails due to model incompat, param mismatch, etc.
-				# We fallback to invoke_model path.
 				log.debug('Converse path failed; falling back to invoke_model.', exc_info=True)
 
 		# 2) Fallback: Claude message format
@@ -297,16 +445,16 @@ class BedrockHelper:
 	# ------------------------------------------------------------------
 
 	def _generate_with_converse(
-			self,
-			*,
-			model_id: str,
-			system_prompt: str,
-			context: str,
-			question: str,
-			max_tokens: int,
-			temperature: float,
-			rag_instructions: str,
-			**extra_params: Any,
+		self,
+		*,
+		model_id: str,
+		system_prompt: str,
+		context: str,
+		question: str,
+		max_tokens: int,
+		temperature: float,
+		rag_instructions: str,
+		**extra_params: Any,
 	) -> RAGResponse:
 		req = build_converse_request(
 			model_id=model_id,
@@ -319,22 +467,22 @@ class BedrockHelper:
 			**extra_params,
 		)
 
-		resp = self.bedrock_runtime.converse(**req)
+		resp = self._call_with_refresh(self.bedrock_runtime.converse, **req)
 		text = extract_converse_text(resp if isinstance(resp, dict) else {})
 		metrics = self._extract_metrics_from_response(resp, resp if isinstance(resp, dict) else None)
 		return RAGResponse(text=text, stream=False, metrics=metrics, raw_response=resp)
 
 	def _generate_with_converse_stream(
-			self,
-			*,
-			model_id: str,
-			system_prompt: str,
-			context: str,
-			question: str,
-			max_tokens: int,
-			temperature: float,
-			rag_instructions: str,
-			**extra_params: Any,
+		self,
+		*,
+		model_id: str,
+		system_prompt: str,
+		context: str,
+		question: str,
+		max_tokens: int,
+		temperature: float,
+		rag_instructions: str,
+		**extra_params: Any,
 	) -> RAGResponse:
 		req = build_converse_request(
 			model_id=model_id,
@@ -347,20 +495,19 @@ class BedrockHelper:
 			**extra_params,
 		)
 
-		resp = self.bedrock_runtime.converse_stream(**req)
-		stream_obj = resp.get("stream")
+		resp = self._call_with_refresh(self.bedrock_runtime.converse_stream, **req)
+		stream_obj = resp.get('stream')
 		if stream_obj is None:
 			raise RuntimeError("converse_stream response missing 'stream'")
 
 		chunks: List[str] = []
 		try:
-			# Reuse your unified parser:
-			iter_bedrock_stream_text(stream_obj, on_text=chunks.append, stream_kind="converse")
+			iter_bedrock_stream_text(stream_obj, on_text=chunks.append, stream_kind='converse')
 		finally:
-			if hasattr(stream_obj, "close"):
+			if hasattr(stream_obj, 'close'):
 				stream_obj.close()
 
-		text = "".join(chunks)
+		text = ''.join(chunks)
 		metrics = self._extract_metrics_from_response(resp, None)
 		return RAGResponse(text=text, stream=True, metrics=metrics, raw_response=None)
 
@@ -369,66 +516,61 @@ class BedrockHelper:
 	# ------------------------------------------------------------------
 
 	def _generate_with_claude_message_format(
-			self,
-			*,
-			model_id: str,
-			system_prompt: str,
-			context: str,
-			question: str,
-			stream: bool,
-			temperature: float,
-			max_tokens: int,
-			rag_instructions: str = '',
-			**extra_params: Any,
+		self,
+		*,
+		model_id: str,
+		system_prompt: str,
+		context: str,
+		question: str,
+		stream: bool,
+		temperature: float,
+		max_tokens: int,
+		rag_instructions: str = '',
+		**extra_params: Any,
 	) -> RAGResponse:
-		user_text = f"{rag_instructions}\nContext:\n{context}\n\nQuestion:\n{question}\n"
-
-		messages = [
-			{
-				"role": "user",
-				"content": [{"type": "text", "text": user_text}],
-			}
-		]
+		user_text = f'{rag_instructions}\nContext:\n{context}\n\nQuestion:\n{question}\n'
 
 		request_body: Dict[str, Any] = {
-			"anthropic_version": "bedrock-2023-05-31",
-			"system": system_prompt,
-			"messages": messages,
-			"max_tokens": max_tokens,
-			"temperature": temperature,
+			'anthropic_version': 'bedrock-2023-05-31',
+			'system': system_prompt,
+			'messages': [{'role': 'user', 'content': [{'type': 'text', 'text': user_text}]}],
+			'max_tokens': max_tokens,
+			'temperature': temperature,
 		}
 		if extra_params:
 			request_body.update(extra_params)
 
 		if stream:
-			resp = self.bedrock_runtime.invoke_model_with_response_stream(
+			resp = self._call_with_refresh(
+				self.bedrock_runtime.invoke_model_with_response_stream,
 				modelId=model_id,
 				body=json.dumps(request_body),
 			)
-			event_stream = resp.get("body")
+			event_stream = resp.get('body')
 			if event_stream is None:
 				raise RuntimeError("invoke_model_with_response_stream response missing 'body'")
 
 			chunks: List[str] = []
 			try:
-				iter_bedrock_stream_text(event_stream, on_text=chunks.append, stream_kind="invoke")
+				iter_bedrock_stream_text(event_stream, on_text=chunks.append, stream_kind='invoke')
 			finally:
-				if hasattr(event_stream, "close"):
+				if hasattr(event_stream, 'close'):
 					event_stream.close()
 
-			text = "".join(chunks)
+			text = ''.join(chunks)
 			metrics = self._extract_metrics_from_response(resp, None)
 			return RAGResponse(text=text, stream=True, metrics=metrics, raw_response=None)
 
-		resp = self.bedrock_runtime.invoke_model(
+		resp = self._call_with_refresh(
+			self.bedrock_runtime.invoke_model,
 			modelId=model_id,
 			body=json.dumps(request_body),
 		)
-		body_bytes = resp.get("body").read()
+		body_bytes = resp.get('body').read()
 		try:
 			body_json = json.loads(body_bytes)
 		except Exception:
-			body_json = {"raw": body_bytes.decode("utf-8", errors="replace")}
+			body_json = {'raw': body_bytes.decode('utf-8', errors='replace')}
 
 		text = self._extract_text_from_claude(body_json)
 		metrics = self._extract_metrics_from_response(resp, body_json if isinstance(body_json, dict) else None)
@@ -463,21 +605,11 @@ class BedrockHelper:
 		return await asyncio.to_thread(self.generate_with_rag, **kwargs)
 
 	async def async_stream_generate_with_rag(self, **kwargs: Any) -> AsyncIterator[str]:
-		"""
-		Async generator that streams Bedrock text deltas.
-
-		- Prefers ConverseStream when available (and prefer_converse=True).
-		- Falls back to invoke_model_with_response_stream using Claude message format.
-		- Raises on error (does NOT yield error text).
-		- Limits concurrent streams to avoid unbounded thread creation.
-		"""
 		kwargs = dict(kwargs)
-		kwargs["stream"] = True
+		kwargs['stream'] = True
 
 		loop = asyncio.get_running_loop()
 		q: asyncio.Queue[Optional[str]] = asyncio.Queue()
-
-		# Store exception from worker thread (if any). We'll raise after draining/terminating.
 		err: Dict[str, BaseException] = {}
 
 		def push_text(t: str) -> None:
@@ -487,60 +619,55 @@ class BedrockHelper:
 			loop.call_soon_threadsafe(q.put_nowait, None)
 
 		def push_error(e: BaseException) -> None:
-			err["exc"] = e
+			err['exc'] = e
 			loop.call_soon_threadsafe(q.put_nowait, None)
 
 		RESERVED_KEYS = {
-			"system_prompt",
-			"context",
-			"include_headers_in_context",
-			"question",
-			"model_id",
-			"stream",
-			"temperature",
-			"max_tokens",
-			"max_context_chars",
-			"prefer_converse",
-			"rag_instructions",
+			'system_prompt',
+			'context',
+			'include_headers_in_context',
+			'question',
+			'model_id',
+			'stream',
+			'temperature',
+			'max_tokens',
+			'max_context_chars',
+			'prefer_converse',
+			'rag_instructions',
 		}
 
 		def extra_params_from_kwargs(d: Dict[str, Any]) -> Dict[str, Any]:
 			return {k: v for k, v in d.items() if k not in RESERVED_KEYS}
 
 		def normalize_context_value(
-				context_value: Union[str, Sequence[str]],
-				*,
-				include_headers_in_context: bool,
-				max_context_chars: Optional[int],
+			context_value: Union[str, Sequence[str]],
+			*,
+			include_headers_in_context: bool,
+			max_context_chars: Optional[int],
 		) -> str:
 			if isinstance(context_value, str):
 				ctx = context_value
 			else:
-				ctx = format_context_passages(
-					list(context_value),
-					include_headers=include_headers_in_context,
-				)
+				ctx = format_context_passages(list(context_value), include_headers=include_headers_in_context)
 			return truncate_by_chars(ctx, max_context_chars)
 
 		def _worker() -> None:
 			acquired = False
 			try:
-				# ---- concurrency guard
 				self._stream_sema.acquire()
 				acquired = True
 
-				selected_model = kwargs.get("model_id") or self.rag_model_id
-				system_prompt = kwargs["system_prompt"]
-				context_value = kwargs["context"]
-				include_headers_in_context = kwargs.get("include_headers_in_context", False)
-				question = kwargs["question"]
+				selected_model = kwargs.get('model_id') or self.rag_model_id
+				system_prompt = kwargs['system_prompt']
+				context_value = kwargs['context']
+				include_headers_in_context = kwargs.get('include_headers_in_context', False)
+				question = kwargs['question']
 
-				# Match sync defaults
-				temperature = kwargs.get("temperature", 0.1)
-				max_tokens = kwargs.get("max_tokens", 1024)
-				max_context_chars = kwargs.get("max_context_chars", 120_000)
-				prefer_converse = kwargs.get("prefer_converse", True)
-				rag_instructions = kwargs.get("rag_instructions", "")
+				temperature = kwargs.get('temperature', 0.1)
+				max_tokens = kwargs.get('max_tokens', 1024)
+				max_context_chars = kwargs.get('max_context_chars', 120_000)
+				prefer_converse = kwargs.get('prefer_converse', True)
+				rag_instructions = kwargs.get('rag_instructions', '')
 
 				ctx = normalize_context_value(
 					context_value,
@@ -550,8 +677,8 @@ class BedrockHelper:
 
 				extra_params = extra_params_from_kwargs(kwargs)
 
-				# 1) Prefer converse_stream (same builder as sync)
-				if prefer_converse and hasattr(self.bedrock_runtime, "converse_stream"):
+				# 1) Prefer converse_stream
+				if prefer_converse and hasattr(self.bedrock_runtime, 'converse_stream'):
 					try:
 						req = build_converse_request(
 							model_id=selected_model,
@@ -563,71 +690,62 @@ class BedrockHelper:
 							rag_instructions=rag_instructions,
 							**extra_params,
 						)
-
-						resp = self.bedrock_runtime.converse_stream(**req)
-						stream_obj = resp.get("stream")
+						resp = self._call_with_refresh(self.bedrock_runtime.converse_stream, **req)
+						stream_obj = resp.get('stream')
 						if stream_obj is None:
 							raise RuntimeError("converse_stream response missing 'stream'")
 
 						try:
-							iter_bedrock_stream_text(stream_obj, on_text=push_text, stream_kind="converse")
+							iter_bedrock_stream_text(stream_obj, on_text=push_text, stream_kind='converse')
 						finally:
-							if hasattr(stream_obj, "close"):
+							if hasattr(stream_obj, 'close'):
 								stream_obj.close()
 
 						push_done()
 						return
 					except Exception:
-						log.debug("converse_stream failed; falling back.", exc_info=True)
+						log.debug('converse_stream failed; falling back.', exc_info=True)
 
-				# 2) Fallback: invoke_model_with_response_stream (Claude message format)
-				# Mirror _generate_with_claude_message_format's user_text behavior
-				prefix = ""
+				# 2) Fallback invoke_model_with_response_stream (Claude message format)
+				prefix = ''
 				if isinstance(rag_instructions, str) and rag_instructions.strip():
-					prefix = rag_instructions.strip() + "\n"
-				user_text = f"{prefix}Context:\n{ctx}\n\nQuestion:\n{question}\n"
+					prefix = rag_instructions.strip() + '\n'
+				user_text = f'{prefix}Context:\n{ctx}\n\nQuestion:\n{question}\n'
 
 				body: Dict[str, Any] = {
-					"anthropic_version": "bedrock-2023-05-31",
-					"system": system_prompt,
-					"messages": [
-						{
-							"role": "user",
-							"content": [{"type": "text", "text": user_text}],
-						}
-					],
-					"max_tokens": max_tokens,
-					"temperature": temperature,
+					'anthropic_version': 'bedrock-2023-05-31',
+					'system': system_prompt,
+					'messages': [{'role': 'user', 'content': [{'type': 'text', 'text': user_text}]}],
+					'max_tokens': max_tokens,
+					'temperature': temperature,
 				}
 				if extra_params:
 					body.update(extra_params)
 
-				resp = self.bedrock_runtime.invoke_model_with_response_stream(
+				resp = self._call_with_refresh(
+					self.bedrock_runtime.invoke_model_with_response_stream,
 					modelId=selected_model,
 					body=json.dumps(body),
 				)
-				event_stream = resp.get("body")
+				event_stream = resp.get('body')
 				if event_stream is None:
 					raise RuntimeError("invoke_model_with_response_stream response missing 'body'")
 
 				try:
-					iter_bedrock_stream_text(event_stream, on_text=push_text, stream_kind="invoke")
+					iter_bedrock_stream_text(event_stream, on_text=push_text, stream_kind='invoke')
 				finally:
-					if hasattr(event_stream, "close"):
+					if hasattr(event_stream, 'close'):
 						event_stream.close()
 
 				push_done()
 
 			except BaseException as e:
-				# propagate the original exception to the async generator
 				push_error(e)
 			finally:
 				if acquired:
 					try:
 						self._stream_sema.release()
 					except Exception:
-						# Should never happen with BoundedSemaphore unless double-release;
-						# swallow to avoid masking original errors.
 						pass
 
 		threading.Thread(target=_worker, daemon=True).start()
@@ -638,8 +756,8 @@ class BedrockHelper:
 				break
 			yield item
 
-		if "exc" in err:
-			raise err["exc"]
+		if 'exc' in err:
+			raise err['exc']
 
 	# ------------------------------------------------------------------
 	# Embeddings
@@ -647,7 +765,8 @@ class BedrockHelper:
 
 	def _embed_one(self, record_id: str, text: str) -> Tuple[str, List[float], InvocationMetrics]:
 		req = {'inputText': text}
-		resp = self.bedrock_runtime.invoke_model(
+		resp = self._call_with_refresh(
+			self.bedrock_runtime.invoke_model,
 			modelId=self.embedding_model_id,
 			body=json.dumps(req),
 		)
@@ -662,14 +781,14 @@ class BedrockHelper:
 		return record_id, embedding, metrics
 
 	def embed_texts(
-			self,
-			records: RecordInput,
-			*,
-			batch_threshold: int = 3000,
-			s3_bucket: Optional[str] = None,
-			s3_prefix: str = 'bedrock_batch',
-			role_arn: Optional[str] = None,
-			max_workers: int = 8,
+		self,
+		records: RecordInput,
+		*,
+		batch_threshold: int = 3000,
+		s3_bucket: Optional[str] = None,
+		s3_prefix: str = 'bedrock_batch',
+		role_arn: Optional[str] = None,
+		max_workers: int = 8,
 	) -> Union[EmbeddingResponse, BatchJobResponse]:
 		pairs = normalize_records(records)
 		if not pairs:
@@ -686,10 +805,10 @@ class BedrockHelper:
 		)
 
 	def _embed_texts_sync_concurrent(
-			self,
-			pairs: List[Tuple[str, str]],
-			*,
-			max_workers: int,
+		self,
+		pairs: List[Tuple[str, str]],
+		*,
+		max_workers: int,
 	) -> EmbeddingResponse:
 		from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -720,12 +839,12 @@ class BedrockHelper:
 	# ------------------------------------------------------------------
 
 	def submit_embedding_batch_job(
-			self,
-			pairs: Union[List[Tuple[str, str]], RecordInput],
-			*,
-			s3_bucket: Optional[str],
-			s3_prefix: str,
-			role_arn: Optional[str],
+		self,
+		pairs: Union[List[Tuple[str, str]], RecordInput],
+		*,
+		s3_bucket: Optional[str],
+		s3_prefix: str,
+		role_arn: Optional[str],
 	) -> BatchJobResponse:
 		if s3_bucket is None or role_arn is None:
 			raise ValueError('s3_bucket and role_arn must be provided for batch embedding jobs')
@@ -745,13 +864,14 @@ class BedrockHelper:
 				tmp_path = tmp.name
 
 			input_key = f'{s3_prefix}/inputs/{job_uuid}.jsonl'
-			self.s3.upload_file(tmp_path, s3_bucket, input_key)
+			self._call_with_refresh(self.s3.upload_file, tmp_path, s3_bucket, input_key)
 			input_s3_uri = f's3://{s3_bucket}/{input_key}'
 
 			output_prefix = f'{s3_prefix}/outputs/{job_uuid}/'
 			output_s3_uri = f's3://{s3_bucket}/{output_prefix}'
 
-			resp = self.bedrock.create_model_invocation_job(
+			resp = self._call_with_refresh(
+				self.bedrock.create_model_invocation_job,
 				jobName=job_name,
 				modelId=self.embedding_model_id,
 				roleArn=role_arn,
@@ -759,12 +879,7 @@ class BedrockHelper:
 				outputDataConfig={'s3OutputDataConfig': {'s3Uri': output_s3_uri}},
 			)
 
-			job_id = (
-					resp.get("jobArn")
-					or resp.get("jobId")
-					or resp.get("jobIdentifier")
-					or resp.get("id")
-			)
+			job_id = resp.get('jobArn') or resp.get('jobId') or resp.get('jobIdentifier') or resp.get('id')
 			if not job_id:
 				job_id = job_name
 
@@ -784,16 +899,15 @@ class BedrockHelper:
 					pass
 
 	def get_batch_job(self, job_id: str) -> dict:
-		return self.bedrock.get_model_invocation_job(jobIdentifier=job_id)
+		return self._call_with_refresh(self.bedrock.get_model_invocation_job, jobIdentifier=job_id)
 
 	def wait_for_batch_job(
-			self,
-			job_id: str,
-			*,
-			poll_seconds: float = 10.0,
-			timeout_seconds: float = 3600.0,
+		self,
+		job_id: str,
+		*,
+		poll_seconds: float = 10.0,
+		timeout_seconds: float = 3600.0,
 	) -> dict:
-
 		deadline = time.time() + timeout_seconds
 		while True:
 			info = self.get_batch_job(job_id)
@@ -808,18 +922,19 @@ class BedrockHelper:
 		if not output_s3_uri.startswith('s3://'):
 			raise ValueError('output_s3_uri must start with s3://')
 
-		rest = output_s3_uri[len('s3://'):]
+		rest = output_s3_uri[len('s3://') :]
 		bucket, _, prefix = rest.partition('/')
 		if prefix and not prefix.endswith('/'):
 			prefix += '/'
 
-		paginator = self.s3.get_paginator('list_objects_v2')
+		paginator = self._call_with_refresh(self.s3.get_paginator, 'list_objects_v2')
 		for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
 			for obj in page.get('Contents', []) or []:
 				key = obj.get('Key')
 				if not key or not key.endswith('.jsonl'):
 					continue
-				body = self.s3.get_object(Bucket=bucket, Key=key)['Body'].read()
+				resp = self._call_with_refresh(self.s3.get_object, Bucket=bucket, Key=key)
+				body = resp['Body'].read()
 				for line in body.splitlines():
 					line = line.strip()
 					if not line:

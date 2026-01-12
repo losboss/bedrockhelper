@@ -5,13 +5,13 @@ from .models import InvocationMetrics, RAGResponse, EmbeddingResponse, BatchJobR
 from .batch import InMemoryJobStore, reconcile_batch_embedding_jobs
 
 __all__ = [
-	"BedrockHelper",
-	"InvocationMetrics",
-	"RAGResponse",
-	"EmbeddingResponse",
-	"BatchJobResponse",
-	"InMemoryJobStore",
-	"reconcile_batch_embedding_jobs",
+	'BedrockHelper',
+	'InvocationMetrics',
+	'RAGResponse',
+	'EmbeddingResponse',
+	'BatchJobResponse',
+	'InMemoryJobStore',
+	'reconcile_batch_embedding_jobs',
 ]
 
-__version__ = "0.1.0"
+__version__ = '0.1.0'

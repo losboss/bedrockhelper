@@ -11,20 +11,22 @@ ProcessEmbeddingsFn = Callable[[BatchJobResponse, Dict[str, List[float]]], None]
 
 
 def state_from_bedrock_status(status: str) -> str:
-	if status == "Completed": return "COMPLETED"
-	if status in ("Failed", "Stopped", "Expired"): return "FAILED"
-	return "RUNNING"
+	if status == 'Completed':
+		return 'COMPLETED'
+	if status in ('Failed', 'Stopped', 'Expired'):
+		return 'FAILED'
+	return 'RUNNING'
 
 
 ProcessEmbeddingsFn = Callable[[BatchJobRef, Dict[str, List[float]]], None]
 
 
 def reconcile_batch_embedding_jobs(
-		*,
-		helper: "BedrockHelper",
-		store: JobStore,
-		process_embeddings: ProcessEmbeddingsFn,
-		limit: int = 25,
+	*,
+	helper: 'BedrockHelper',
+	store: JobStore,
+	process_embeddings: ProcessEmbeddingsFn,
+	limit: int = 25,
 ) -> Tuple[int, int, int]:
 	"""
 	Poll and reconcile unfinished batch embedding jobs.
@@ -65,7 +67,7 @@ def reconcile_batch_embedding_jobs(
 						state=state_from_bedrock_status(bedrock_status),
 						last_checked_at=now,
 						attempts=attempts,
-						last_error="Completed but parsed 0 embeddings from output",
+						last_error='Completed but parsed 0 embeddings from output',
 						bedrock_status=bedrock_status,
 					)
 					failed += 1
