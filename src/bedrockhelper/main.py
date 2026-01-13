@@ -59,6 +59,7 @@ from bedrockhelper.utils import (
 	iter_bedrock_stream_text,
 	normalize_headers,
 	normalize_records,
+	normalize_s3_bucket_name,
 	truncate_by_chars,
 )
 
@@ -819,6 +820,8 @@ class BedrockHelper:
 		s3_prefix: str = 'bedrock_batch',
 		role_arn: Optional[str] = None,
 		max_workers: int = 8,
+		input_data_config: Optional[dict] = None,
+		output_data_config: Optional[dict] = None,
 	) -> Union[EmbeddingResponse, BatchJobResponse]:
 		pairs = normalize_records(records)
 		if not pairs:
@@ -832,6 +835,8 @@ class BedrockHelper:
 			s3_bucket=s3_bucket,
 			s3_prefix=s3_prefix,
 			role_arn=role_arn,
+			input_data_config=input_data_config,
+			output_data_config=output_data_config,
 		)
 
 	def _embed_texts_sync_concurrent(
@@ -875,9 +880,15 @@ class BedrockHelper:
 		s3_bucket: Optional[str],
 		s3_prefix: str,
 		role_arn: Optional[str],
+		input_data_config: Optional[dict] = None,
+		output_data_config: Optional[dict] = None,
 	) -> BatchJobResponse:
-		if s3_bucket is None or role_arn is None:
-			raise ValueError('s3_bucket and role_arn must be provided for batch embedding jobs')
+		if s3_bucket is None:
+			raise ValueError('s3_bucket must be provided for batch embedding jobs')
+		if role_arn is None:
+			raise ValueError('role_arn must be provided for batch embedding jobs')
+
+		s3_bucket = normalize_s3_bucket_name(s3_bucket)
 
 		if not isinstance(pairs, list) or (pairs and not isinstance(pairs[0], tuple)):
 			pairs = normalize_records(pairs)  # type: ignore[assignment]
@@ -895,18 +906,24 @@ class BedrockHelper:
 
 			input_key = f'{s3_prefix}/inputs/{job_uuid}.jsonl'
 			self._call_with_refresh(self.s3.upload_file, tmp_path, s3_bucket, input_key)
-			input_s3_uri = f's3://{s3_bucket}/{input_key}'
+			input_s3_uri = f'{s3_bucket}/{input_key}'
 
 			output_prefix = f'{s3_prefix}/outputs/{job_uuid}/'
-			output_s3_uri = f's3://{s3_bucket}/{output_prefix}'
+			output_s3_uri = f'{s3_bucket}/{output_prefix}'
+
+			if input_data_config is None:
+				input_data_config = {'s3InputDataConfig': {'s3Uri': input_s3_uri}}
+
+			if output_data_config is None:
+				output_data_config = {'s3OutputDataConfig': {'s3Uri': output_s3_uri}}
 
 			resp = self._call_with_refresh(
 				self.bedrock.create_model_invocation_job,
 				jobName=job_name,
 				modelId=self.embedding_model_id,
 				roleArn=role_arn,
-				inputDataConfig={'s3InputDataConfig': {'s3Uri': input_s3_uri}},
-				outputDataConfig={'s3OutputDataConfig': {'s3Uri': output_s3_uri}},
+				inputDataConfig=input_data_config,
+				outputDataConfig=output_data_config,
 			)
 
 			job_id = resp.get('jobArn') or resp.get('jobId') or resp.get('jobIdentifier') or resp.get('id')

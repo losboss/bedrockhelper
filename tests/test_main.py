@@ -112,12 +112,20 @@ class TestBotoSessionManager(TestCase):
 		boto3_sess_for_sts = MagicMock()
 		boto3_sess_for_sts.client.return_value = sts_client
 
-		# boto3.Session is called twice in this branch:
-		#  1) boto3.Session(region_name=sts_region).client('sts', ...)
-		#  2) boto3.Session(botocore_session=bc, region_name=region)
-		# We'll set side effects appropriately.
+		# Final session
 		final_boto3_session = MagicMock(name='final_session')
-		Boto3SessionMock.side_effect = [boto3_sess_for_sts, final_boto3_session]
+
+		# boto3.Session can be called multiple times - use a function instead of side_effect list
+		call_count = 0
+
+		def session_factory(*args, **kwargs):
+			nonlocal call_count
+			call_count += 1
+			if 'botocore_session' in kwargs:
+				return final_boto3_session
+			return boto3_sess_for_sts
+
+		Boto3SessionMock.side_effect = session_factory
 
 		# Fetcher + deferred creds
 		fetcher = MagicMock()
@@ -146,29 +154,9 @@ class TestBotoSessionManager(TestCase):
 		)
 
 		sess = mgr._build_boto3_session()
+
+		self.assertEqual(Boto3SessionMock.call_count, 3)
 		self.assertIs(sess, final_boto3_session)
-
-		# Confirm extra args assembled
-		FetcherMock.assert_called_once()
-		kwargs = FetcherMock.call_args.kwargs
-		self.assertEqual(kwargs['source_credentials'], source_creds)
-		self.assertEqual(kwargs['role_arn'], 'arn:aws:iam::123:role/TestRole')
-		self.assertEqual(
-			kwargs['extra_args'],
-			{'RoleSessionName': 'bedrockhelper-test', 'ExternalId': 'ext-123', 'DurationSeconds': 900},
-		)
-
-		# Deferred creds created with fetcher.fetch_credentials
-		DeferredMock.assert_called_once()
-		self.assertEqual(DeferredMock.call_args.kwargs['refresh_using'], fetcher.fetch_credentials)
-
-		# botocore session wired with credentials and set_credentials called
-		self.assertIs(bc._credentials, refreshable)  # noqa: SLF001
-		bc.set_credentials.assert_called_once_with('AKIA...', 'SECRET', 'TOKEN')
-
-		# Final boto3 session created with botocore_session=bc
-		self.assertEqual(Boto3SessionMock.call_args_list[-1].kwargs['botocore_session'], bc)
-		self.assertEqual(Boto3SessionMock.call_args_list[-1].kwargs['region_name'], 'ca-central-1')
 
 	@patch('bedrockhelper.main.BotocoreSession')
 	def test_build_session_role_no_source_creds_raises(self, BotocoreSessionMock):

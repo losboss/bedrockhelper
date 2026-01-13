@@ -1,8 +1,7 @@
 import json
-from typing import Mapping, Dict, List, Sequence, Any, Callable, Iterable, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from bedrockhelper.types import RecordInput
-
 
 DEFAULT_STOP_TYPES_INVOKE: Tuple[str, ...] = ('message_stop', 'completion_stop', 'end')
 DEFAULT_STOP_KEYS_CONVERSE: Tuple[str, ...] = ('messageStop', 'message_stop', 'stop', 'end')
@@ -217,3 +216,13 @@ def build_converse_request(
 		req.update(extra_params)
 
 	return req
+
+
+def normalize_s3_bucket_name(bucket: str) -> str:
+	"""
+	Normalize an S3 bucket name by adding the "s3://" prefix if missing.
+	"""
+	bucket = bucket.strip()
+	if not bucket.startswith('s3://'):
+		bucket = f's3://{bucket}'
+	return bucket

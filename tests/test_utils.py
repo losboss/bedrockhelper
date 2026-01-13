@@ -1,15 +1,16 @@
-from unittest import TestCase
 import json
+from unittest import TestCase
 
 from bedrockhelper.main import (
+	build_converse_request,
+	extract_converse_text,
+	format_context_passages,
 	iter_bedrock_stream_text,
+	normalize_headers,
 	normalize_records,
 	truncate_by_chars,
-	format_context_passages,
-	normalize_headers,
-	extract_converse_text,
-	build_converse_request,
 )
+from bedrockhelper.utils import normalize_s3_bucket_name
 
 
 class TestIterBedrockStreamText(TestCase):
@@ -470,3 +471,11 @@ class TestBuildConverseRequest(TestCase):
 		# inferenceConfig types preserved as passed
 		self.assertEqual(req['inferenceConfig']['maxTokens'], 0)
 		self.assertEqual(req['inferenceConfig']['temperature'], 0.0)
+
+
+class TestNormalizeS3BucketName(TestCase):
+	def test_normalizes_s3_bucket_name(self):
+		self.assertEqual(normalize_s3_bucket_name('my-bucket'), 's3://my-bucket')
+		self.assertEqual(normalize_s3_bucket_name('s3://my-bucket'), 's3://my-bucket')
+		self.assertEqual(normalize_s3_bucket_name('  my-bucket  '), 's3://my-bucket')
+		self.assertEqual(normalize_s3_bucket_name('  s3://my-bucket  '), 's3://my-bucket')
