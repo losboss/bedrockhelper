@@ -975,7 +975,7 @@ class BedrockHelper:
 		for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
 			for obj in page.get('Contents', []) or []:
 				key = obj.get('Key')
-				if not key or not key.endswith('.jsonl'):
+				if not key or not key.endswith(('.jsonl', '.jsonl.out')):
 					continue
 				resp = self._call_with_refresh(self.s3.get_object, Bucket=bucket, Key=key)
 				body = resp['Body'].read()
