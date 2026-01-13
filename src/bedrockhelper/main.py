@@ -109,6 +109,28 @@ class _BotoSessionManager:
 			self._boto3_session = None
 			self._clients.clear()
 
+	def _is_already_assumed_role(self, target_role_arn: str) -> bool:
+		"""Check if current credentials are already for the target role."""
+		try:
+			# Create temporary STS client to check current identity
+			temp_session = boto3.Session(region_name=self._sts_region)
+			temp_sts = temp_session.client('sts', config=self._cfg)
+			caller_identity = temp_sts.get_caller_identity()
+
+			# Extract ARN from current credentials
+			current_arn = caller_identity.get('Arn', '')
+
+			# Check if current ARN matches the target role
+			# Format: arn:aws:sts::account:assumed-role/role-name/session-name
+			if 'assumed-role' in current_arn and target_role_arn in current_arn:
+				log.info(f'Already using assumed role: {current_arn}')
+				return True
+
+			return False
+		except Exception:
+			# If we can't determine, proceed with assumption
+			return False
+
 	def _build_boto3_session(self) -> boto3.Session:
 		# No explicit role -> rely on normal resolution (IMDS/IRSA/ECS/SSO/etc). Refresh handled by botocore.
 		if not self._role_arn:
@@ -121,8 +143,12 @@ class _BotoSessionManager:
 		# Ensure source credentials are loaded (refreshable if the provider supports it).
 		source_creds = bc.get_credentials()
 		if source_creds is None:
-			# This mirrors boto3 behavior; raise a helpful error early.
 			raise RuntimeError('Unable to resolve AWS source credentials for AssumeRole')
+
+		# Check if we're already using the target role
+		if self._is_already_assumed_role(self._role_arn):
+			log.info('Skipping role assumption - already using target role')
+			return boto3.Session(region_name=self._region)
 
 		# STS client created from a standard boto3 session using source creds.
 		sts = boto3.Session(region_name=self._sts_region).client('sts', config=self._cfg)
