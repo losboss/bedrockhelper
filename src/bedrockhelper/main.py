@@ -817,11 +817,10 @@ class BedrockHelper:
 		*,
 		batch_threshold: int = 3000,
 		s3_bucket: Optional[str] = None,
-		s3_prefix: str = 'bedrock_batch',
+		s3_prefix: Optional[str] = 'bedrock_batch',
 		role_arn: Optional[str] = None,
-		max_workers: int = 8,
-		input_data_config: Optional[dict] = None,
-		output_data_config: Optional[dict] = None,
+		max_workers: Optional[int] = None,
+		s3_bucket_owner: Optional[str] = None,
 	) -> Union[EmbeddingResponse, BatchJobResponse]:
 		pairs = normalize_records(records)
 		if not pairs:
@@ -831,12 +830,7 @@ class BedrockHelper:
 			return self._embed_texts_sync_concurrent(pairs, max_workers=max_workers)
 
 		return self.submit_embedding_batch_job(
-			pairs,
-			s3_bucket=s3_bucket,
-			s3_prefix=s3_prefix,
-			role_arn=role_arn,
-			input_data_config=input_data_config,
-			output_data_config=output_data_config,
+			pairs, s3_bucket=s3_bucket, s3_prefix=s3_prefix, role_arn=role_arn, s3_bucket_owner=s3_bucket_owner
 		)
 
 	def _embed_texts_sync_concurrent(
@@ -880,7 +874,7 @@ class BedrockHelper:
 		s3_bucket: Optional[str],
 		s3_prefix: str,
 		role_arn: Optional[str],
-		s3_bucket_owner: Optional[int] = None,
+		s3_bucket_owner: Optional[str] = None,
 	) -> BatchJobResponse:
 		if s3_bucket is None:
 			raise ValueError('s3_bucket must be provided for batch embedding jobs')
