@@ -880,8 +880,7 @@ class BedrockHelper:
 		s3_bucket: Optional[str],
 		s3_prefix: str,
 		role_arn: Optional[str],
-		input_data_config: Optional[dict] = None,
-		output_data_config: Optional[dict] = None,
+		s3_bucket_owner: Optional[int] = None,
 	) -> BatchJobResponse:
 		if s3_bucket is None:
 			raise ValueError('s3_bucket must be provided for batch embedding jobs')
@@ -905,31 +904,35 @@ class BedrockHelper:
 				tmp_path = tmp.name
 
 			input_key = f'{s3_prefix}/inputs/{job_uuid}.jsonl'
+			log.info(f'Uploading batch embedding input to s3://{s3_bucket}/{input_key}')
 			self._call_with_refresh(self.s3.upload_file, tmp_path, s3_bucket, input_key)
-			input_s3_uri = f'{s3_bucket}/{input_key}'
+			input_s3_uri = f's3://{s3_bucket}/{input_key}'
 
 			output_prefix = f'{s3_prefix}/outputs/{job_uuid}/'
-			output_s3_uri = f'{s3_bucket}/{output_prefix}'
+			output_s3_uri = f's3://{s3_bucket}/{output_prefix}'
 
-			if input_data_config is None:
-				input_data_config = {'s3InputDataConfig': {'s3Uri': input_s3_uri}}
+			input_config = {'s3InputDataConfig': {'s3Uri': input_s3_uri}}
+			output_config = {'s3OutputDataConfig': {'s3Uri': output_s3_uri}}
 
-			if output_data_config is None:
-				output_data_config = {'s3OutputDataConfig': {'s3Uri': output_s3_uri}}
+			if s3_bucket_owner is not None:
+				input_config['s3InputDataConfig']['s3BucketOwner'] = str(s3_bucket_owner)
+				output_config['s3OutputDataConfig']['s3BucketOwner'] = str(s3_bucket_owner)
 
+			log.info(f'Creating batch embedding job {job_name}')
 			resp = self._call_with_refresh(
 				self.bedrock.create_model_invocation_job,
 				jobName=job_name,
 				modelId=self.embedding_model_id,
 				roleArn=role_arn,
-				inputDataConfig=input_data_config,
-				outputDataConfig=output_data_config,
+				inputDataConfig=input_config,
+				outputDataConfig=output_config,
 			)
 
 			job_id = resp.get('jobArn') or resp.get('jobId') or resp.get('jobIdentifier') or resp.get('id')
 			if not job_id:
 				job_id = job_name
 
+			log.info(f'Created batch embedding job {job_name} with ID {job_id}')
 			return BatchJobResponse(
 				job_id=str(job_id),
 				job_name=job_name,

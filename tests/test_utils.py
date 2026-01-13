@@ -475,7 +475,7 @@ class TestBuildConverseRequest(TestCase):
 
 class TestNormalizeS3BucketName(TestCase):
 	def test_normalizes_s3_bucket_name(self):
-		self.assertEqual(normalize_s3_bucket_name('my-bucket'), 's3://my-bucket')
-		self.assertEqual(normalize_s3_bucket_name('s3://my-bucket'), 's3://my-bucket')
-		self.assertEqual(normalize_s3_bucket_name('  my-bucket  '), 's3://my-bucket')
-		self.assertEqual(normalize_s3_bucket_name('  s3://my-bucket  '), 's3://my-bucket')
+		self.assertEqual(normalize_s3_bucket_name('my-bucket'), 'my-bucket')
+		self.assertEqual(normalize_s3_bucket_name('s3://my-bucket'), 'my-bucket')
+		self.assertEqual(normalize_s3_bucket_name('  my-bucket  '), 'my-bucket')
+		self.assertEqual(normalize_s3_bucket_name('  s3://my-bucket  '), 'my-bucket')

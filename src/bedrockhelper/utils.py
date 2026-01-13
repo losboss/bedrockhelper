@@ -220,9 +220,9 @@ def build_converse_request(
 
 def normalize_s3_bucket_name(bucket: str) -> str:
 	"""
-	Normalize an S3 bucket name by adding the "s3://" prefix if missing.
+	Strips "s3://" prefix from bucket name if present.
 	"""
 	bucket = bucket.strip()
-	if not bucket.startswith('s3://'):
-		bucket = f's3://{bucket}'
+	if bucket.startswith('s3://'):
+		return bucket[len('s3://') :]
 	return bucket
