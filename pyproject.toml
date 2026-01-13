@@ -12,6 +12,7 @@ include = ["README.md", "LICENSE*"]
 python = ">=3.10,<4.0"
 boto3 = "^1.42.25"
 botocore = {extras = ["crt"], version = "^1.42.25"}
+boto3-stubs = "~=1.42.25"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^9.0.2"
