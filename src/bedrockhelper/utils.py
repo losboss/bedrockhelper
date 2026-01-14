@@ -1,10 +1,14 @@
 import json
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+import threading
+from queue import Queue
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from bedrockhelper.types import RecordInput
 
 DEFAULT_STOP_TYPES_INVOKE: Tuple[str, ...] = ('message_stop', 'completion_stop', 'end')
 DEFAULT_STOP_KEYS_CONVERSE: Tuple[str, ...] = ('messageStop', 'message_stop', 'stop', 'end')
+
+_SENTINEL = object()
 
 
 def iter_bedrock_stream_text(
@@ -36,7 +40,8 @@ def iter_bedrock_stream_text(
 			msg = json.loads(raw.decode(decode))
 		except Exception:
 			return False
-
+		if not isinstance(msg, dict):
+			return False
 		delta = msg.get('delta')
 		if isinstance(delta, dict):
 			t = delta.get('text')
@@ -229,3 +234,106 @@ def normalize_s3_bucket_name(bucket: str) -> str:
 	if bucket.startswith('s3://'):
 		return bucket[len('s3://') :]
 	return bucket
+
+
+def _iter_stream_with_callback(event_stream, *, stream_kind: str) -> Iterator[str]:
+	"""
+	Adapt iter_bedrock_stream_text(callback-based) into an Iterator[str].
+	Ensures the underlying stream is closed when the iterator ends.
+	"""
+	q: 'Queue[object]' = Queue()
+	err: Dict[str, BaseException] = {}
+
+	def on_text(t: str) -> None:
+		q.put(t)
+
+	def worker() -> None:
+		try:
+			iter_bedrock_stream_text(event_stream, on_text=on_text, stream_kind=stream_kind)
+		except BaseException as e:
+			err['exc'] = e
+		finally:
+			try:
+				if hasattr(event_stream, 'close'):
+					event_stream.close()
+			finally:
+				q.put(_SENTINEL)
+
+	threading.Thread(target=worker, daemon=True).start()
+
+	while True:
+		item = q.get()
+		if item is _SENTINEL:
+			break
+		yield item  # str
+
+	if 'exc' in err:
+		raise err['exc']
+
+
+def iter_bedrock_stream_text_gen_with_tail(
+	event_stream: Iterable[dict],
+	*,
+	decode: str = 'utf-8',
+	on_tail: Callable[[dict], None],
+) -> Iterator[str]:
+	"""
+	Yield text deltas. Best-effort: whenever we parse a JSON message that contains
+	usage/metrics-ish fields, we call on_tail(msg).
+	"""
+
+	def _maybe_capture_tail(msg: Any) -> None:
+		if not isinstance(msg, dict):
+			return
+		# best-effort heuristics
+		if (
+			'usage' in msg
+			or 'amazon-bedrock-invocationMetrics' in msg
+			or 'invocationMetrics' in msg
+			or 'messageStop' in msg
+			or 'message_stop' in msg
+		):
+			on_tail(msg)
+
+	for event_item in event_stream:
+		if not isinstance(event_item, dict):
+			continue
+
+		if 'messageStop' in event_item or 'message_stop' in event_item:
+			_maybe_capture_tail(event_item)
+			break
+
+		# INVOKE shape: {"chunk": {"bytes": b"...json..."}}
+		if 'chunk' in event_item and isinstance(event_item.get('chunk'), dict):
+			raw = event_item['chunk'].get('bytes')
+			if not raw:
+				continue
+			try:
+				msg = json.loads(raw.decode(decode))
+			except Exception:
+				continue
+
+			_maybe_capture_tail(msg)
+
+			if not isinstance(msg, dict):
+				continue
+			delta = msg.get('delta')
+			if isinstance(delta, dict):
+				t = delta.get('text')
+				if isinstance(t, str) and t:
+					yield t
+
+			# stop condition
+			if msg.get('type') in ('message_stop', 'messageStop', 'stop', 'end_turn', 'endTurn'):
+				break
+
+		# CONVERSE-like shape: {"contentBlockDelta": {"delta": {"text": "..."}}} etc.
+		if 'contentBlockDelta' in event_item or 'content_block_delta' in event_item:
+			_maybe_capture_tail(event_item)
+			cbd = event_item.get('contentBlockDelta') or event_item.get('content_block_delta')
+			if isinstance(cbd, dict):
+				delta = cbd.get('delta')
+				if isinstance(delta, dict):
+					t = delta.get('text')
+					if isinstance(t, str) and t:
+						yield t

@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Optional, Dict, List, Union, Any
+from typing import Any, Callable, Dict, Iterator, List, Optional, Union
 
 _TERMINAL_STATUSES = {'Completed', 'Failed', 'Stopped', 'Expired'}
 _SUCCESS_STATUSES = {'Completed'}
@@ -35,6 +35,60 @@ class RAGResponse:
 	stream: bool
 	metrics: InvocationMetrics
 	raw_response: Optional[dict] = None
+
+
+class RAGStream:
+	"""
+	Iterable stream of text deltas. After iteration completes, `.result`
+	contains a RAGResponse with full text + best-effort end metrics.
+	"""
+
+	def __init__(
+		self,
+		*,
+		iterator_factory: Callable[[], Iterator[str]],
+		header_metrics: InvocationMetrics,
+		build_final: Callable[[str, Optional[dict]], RAGResponse],
+	) -> None:
+		self._iterator_factory = iterator_factory
+		self.header_metrics = header_metrics
+		self._build_final = build_final
+
+		self._chunks: List[str] = []
+		self._tail_body: Optional[dict] = None
+		self._result: Optional[RAGResponse] = None
+		self._consumed = False
+
+	@property
+	def metrics(self) -> InvocationMetrics:
+		"""
+		Back-compat alias. This is the "early" metrics (mostly headers).
+		Final/complete metrics are on `self.result.metrics`.
+		"""
+		return self.header_metrics
+
+	def __iter__(self) -> Iterator[str]:
+		if self._consumed:
+			raise RuntimeError('RAGStream can only be iterated once')
+
+		self._consumed = True
+
+		for t in self._iterator_factory():
+			self._chunks.append(t)
+			yield t
+
+		full_text = ''.join(self._chunks)
+		self._result = self._build_final(full_text, self._tail_body)
+
+	@property
+	def result(self) -> RAGResponse:
+		if self._result is None:
+			raise RuntimeError('Stream not finished yet; iterate it to completion first')
+		return self._result
+
+	# internal hook
+	def _set_tail_body(self, tail: dict) -> None:
+		self._tail_body = tail
 
 
 @dataclass

@@ -31,6 +31,7 @@ import uuid
 from typing import (
 	Any,
 	AsyncIterator,
+	Callable,
 	Dict,
 	Iterator,
 	List,
@@ -46,17 +47,12 @@ from botocore.credentials import AssumeRoleCredentialFetcher, DeferredRefreshabl
 from botocore.exceptions import ClientError
 from botocore.session import Session as BotocoreSession
 
-from bedrockhelper.models import (
-	BatchJobResponse,
-	EmbeddingResponse,
-	InvocationMetrics,
-	RAGResponse,
-)
+from bedrockhelper.models import BatchJobResponse, EmbeddingResponse, InvocationMetrics, RAGResponse, RAGStream
 from bedrockhelper.utils import (
 	build_converse_request,
 	extract_converse_text,
 	format_context_passages,
-	iter_bedrock_stream_text,
+	iter_bedrock_stream_text_gen_with_tail,
 	normalize_headers,
 	normalize_records,
 	normalize_s3_bucket_name,
@@ -210,40 +206,54 @@ def _is_expired_token(err: BaseException) -> bool:
 	return False
 
 
+def _make_on_tail(stream_ref: Dict[str, RAGStream]) -> Callable[[dict], None]:
+	def on_tail(msg: dict) -> None:
+		s = stream_ref.get('stream')
+		if s is None:
+			return
+
+		# Prefer tails that include 'usage' (best for cost estimation).
+		prev = getattr(s, '_tail_body', None)
+		if not isinstance(prev, dict):
+			s._set_tail_body(msg)
+			return
+
+		# If we already have usage, keep it.
+		if 'usage' in prev:
+			return
+
+		# If new msg has usage, upgrade.
+		if 'usage' in msg:
+			s._set_tail_body(msg)
+			return
+
+		# Otherwise keep latest (helps catch messageStop etc.)
+		s._set_tail_body(msg)
+
+	return on_tail
+
+
+# --------------------------------------------------------------------------------------
+# Public API
+# --------------------------------------------------------------------------------------
+
+
 class BedrockHelper:
 	"""
 	Utility class for interacting with Amazon Bedrock.
 
-	Core methods are synchronous (boto3 is sync).
-	Async wrappers are provided for event-loop safe usage.
+	Synchronous core methods; async wrappers provided.
 
-	Parameters
-	----------
-	region_name:
-	        AWS region for Bedrock. Defaults to ca-central-1
-	rag_model_id:
-	        Default model id for RAG chat (Claude, etc.). Defaults to Claude Sonnet 4.5
-	embedding_model_id:
-	        Default model id for embeddings. Defaults to Titan v2
-	botocore_config:
-	        Optional botocore Config for retries/timeouts.
-	role_arn / role_session_name / external_id / assume_role_duration_seconds:
-	        Optional: assume role (refreshable).
-	s3_client, bedrock_runtime_client, bedrock_client:
-	        Optional preconfigured clients (for testing/custom endpoints).
+	Important split:
+	- generate_with_rag(...) -> non-streaming only (returns full text + metrics)
+	- stream_with_rag(...)   -> streaming only (returns RAGStream which yields deltas + metrics)
 	"""
 
 	def __init__(
 		self,
 		region_name: str = os.getenv('AWS_REGION', 'ca-central-1'),
-		rag_model_id: str = os.getenv(
-			'AWS_MODEL_ID',
-			'global.anthropic.claude-sonnet-4-5-20250929-v1:0',
-		),
-		embedding_model_id: str = os.getenv(
-			'AWS_EMBEDDING_MODEL_ID',
-			'amazon.titan-embed-text-v2:0',
-		),
+		rag_model_id: Optional[str] = None,
+		embedding_model_id: Optional[str] = None,
 		*,
 		botocore_config: Optional[Config] = None,
 		# assume role (optional)
@@ -258,6 +268,12 @@ class BedrockHelper:
 		# streaming
 		max_concurrent_streams: int = 8,
 	) -> None:
+		self.rag_model_id = (
+			rag_model_id or os.environ.get('AWS_MODEL_ID') or 'global.anthropic.claude-sonnet-4-5-20250929-v1:0'
+		)
+		self.embedding_model_id = (
+			embedding_model_id or os.environ.get('AWS_EMBEDDING_MODEL_ID') or 'amazon.titan-embed-text-v2:0'
+		)
 		if max_concurrent_streams < 1:
 			raise ValueError('max_concurrent_streams must be >= 1')
 
@@ -291,9 +307,6 @@ class BedrockHelper:
 		self.bedrock_runtime = bedrock_runtime_client or self._session_mgr.client('bedrock-runtime')
 		self.bedrock = bedrock_client or self._session_mgr.client('bedrock')
 		self.s3 = s3_client or self._session_mgr.client('s3')
-
-		self.rag_model_id = rag_model_id
-		self.embedding_model_id = embedding_model_id
 
 	def _refresh_clients_if_needed(self) -> None:
 		# Rebind only non-injected clients.
@@ -403,7 +416,7 @@ class BedrockHelper:
 		return metrics
 
 	# ------------------------------------------------------------------
-	# Public RAG API
+	# RAG (non-streaming)
 	# ------------------------------------------------------------------
 
 	def generate_with_rag(
@@ -412,9 +425,8 @@ class BedrockHelper:
 		system_prompt: str,
 		context: Union[str, Sequence[str]],
 		include_headers_in_context: bool = False,
-		question: Optional[str] = '',  # if its not provided, assume it's in system_prompt
+		question: Optional[str] = '',
 		model_id: Optional[str] = None,
-		stream: bool = False,
 		temperature: float = 0.1,
 		max_tokens: int = 8192,
 		max_context_chars: Optional[int] = 150_000,
@@ -431,25 +443,13 @@ class BedrockHelper:
 
 		ctx = truncate_by_chars(ctx, max_context_chars)
 
-		# 1) Prefer Converse if present
 		if prefer_converse and hasattr(self.bedrock_runtime, 'converse'):
 			try:
-				if stream and hasattr(self.bedrock_runtime, 'converse_stream'):
-					return self._generate_with_converse_stream(
-						model_id=selected_model,
-						system_prompt=system_prompt,
-						context=ctx,
-						question=question,
-						max_tokens=max_tokens,
-						temperature=temperature,
-						rag_instructions=rag_instructions,
-						**extra_params,
-					)
 				return self._generate_with_converse(
 					model_id=selected_model,
 					system_prompt=system_prompt,
 					context=ctx,
-					question=question,
+					question=str(question or ''),
 					max_tokens=max_tokens,
 					temperature=temperature,
 					rag_instructions=rag_instructions,
@@ -463,17 +463,12 @@ class BedrockHelper:
 			model_id=selected_model,
 			system_prompt=system_prompt,
 			context=ctx,
-			question=question,
-			stream=stream,
+			question=str(question or ''),
 			temperature=temperature,
 			max_tokens=max_tokens,
 			rag_instructions=rag_instructions,
 			**extra_params,
 		)
-
-	# ------------------------------------------------------------------
-	# Converse implementations
-	# ------------------------------------------------------------------
 
 	def _generate_with_converse(
 		self,
@@ -503,49 +498,6 @@ class BedrockHelper:
 		metrics = self._extract_metrics_from_response(resp, resp if isinstance(resp, dict) else None)
 		return RAGResponse(text=text, stream=False, metrics=metrics, raw_response=resp)
 
-	def _generate_with_converse_stream(
-		self,
-		*,
-		model_id: str,
-		system_prompt: str,
-		context: str,
-		question: str,
-		max_tokens: int,
-		temperature: float,
-		rag_instructions: str,
-		**extra_params: Any,
-	) -> RAGResponse:
-		req = build_converse_request(
-			model_id=model_id,
-			system_prompt=system_prompt,
-			context=context,
-			question=question,
-			max_tokens=max_tokens,
-			temperature=temperature,
-			rag_instructions=rag_instructions,
-			**extra_params,
-		)
-
-		resp = self._call_with_refresh(self.bedrock_runtime.converse_stream, **req)
-		stream_obj = resp.get('stream')
-		if stream_obj is None:
-			raise RuntimeError("converse_stream response missing 'stream'")
-
-		chunks: List[str] = []
-		try:
-			iter_bedrock_stream_text(stream_obj, on_text=chunks.append, stream_kind='converse')
-		finally:
-			if hasattr(stream_obj, 'close'):
-				stream_obj.close()
-
-		text = ''.join(chunks)
-		metrics = self._extract_metrics_from_response(resp, None)
-		return RAGResponse(text=text, stream=True, metrics=metrics, raw_response=None)
-
-	# ------------------------------------------------------------------
-	# invoke_model fallback (Claude message format)
-	# ------------------------------------------------------------------
-
 	def _generate_with_claude_message_format(
 		self,
 		*,
@@ -553,7 +505,6 @@ class BedrockHelper:
 		system_prompt: str,
 		context: str,
 		question: str,
-		stream: bool,
 		temperature: float,
 		max_tokens: int,
 		rag_instructions: str = '',
@@ -572,27 +523,6 @@ class BedrockHelper:
 		}
 		if extra_params:
 			request_body.update(extra_params)
-
-		if stream:
-			resp = self._call_with_refresh(
-				self.bedrock_runtime.invoke_model_with_response_stream,
-				modelId=model_id,
-				body=json.dumps(request_body),
-			)
-			event_stream = resp.get('body')
-			if event_stream is None:
-				raise RuntimeError("invoke_model_with_response_stream response missing 'body'")
-
-			chunks: List[str] = []
-			try:
-				iter_bedrock_stream_text(event_stream, on_text=chunks.append, stream_kind='invoke')
-			finally:
-				if hasattr(event_stream, 'close'):
-					event_stream.close()
-
-			text = ''.join(chunks)
-			metrics = self._extract_metrics_from_response(resp, None)
-			return RAGResponse(text=text, stream=True, metrics=metrics, raw_response=None)
 
 		resp = self._call_with_refresh(
 			self.bedrock_runtime.invoke_model,
@@ -631,19 +561,179 @@ class BedrockHelper:
 		return ''
 
 	# ------------------------------------------------------------------
+	# RAG (streaming)
+	# ------------------------------------------------------------------
+
+	def stream_with_rag(
+		self,
+		*,
+		system_prompt: str,
+		context: Union[str, Sequence[str]],
+		include_headers_in_context: bool = False,
+		question: Optional[str] = '',
+		model_id: Optional[str] = None,
+		temperature: float = 0.1,
+		max_tokens: int = 8192,
+		max_context_chars: Optional[int] = 150_000,
+		prefer_converse: bool = True,
+		rag_instructions: str = '',
+		**extra_params: Any,
+	) -> RAGStream:
+		selected_model = model_id or self.rag_model_id
+
+		if isinstance(context, str):
+			ctx = context
+		else:
+			ctx = format_context_passages(list(context), include_headers=include_headers_in_context)
+
+		ctx = truncate_by_chars(ctx, max_context_chars)
+
+		# 1) Prefer converse_stream
+		if prefer_converse and hasattr(self.bedrock_runtime, 'converse_stream'):
+			try:
+				req = build_converse_request(
+					model_id=selected_model,
+					system_prompt=system_prompt,
+					context=ctx,
+					question=str(question or ''),
+					max_tokens=max_tokens,
+					temperature=temperature,
+					rag_instructions=rag_instructions,
+					**extra_params,
+				)
+				resp = self._call_with_refresh(self.bedrock_runtime.converse_stream, **req)
+				stream_obj = resp.get('stream')
+				if stream_obj is None:
+					raise RuntimeError("converse_stream response missing 'stream'")
+
+				header_metrics = self._extract_metrics_from_response(resp, None)
+
+				# stream instance ref so on_tail can call stream._set_tail_body(...)
+				stream_ref: Dict[str, RAGStream] = {}
+
+				def iterator_factory() -> Iterator[str]:
+					on_tail = _make_on_tail(stream_ref)
+					try:
+						yield from iter_bedrock_stream_text_gen_with_tail(
+							stream_obj,
+							on_tail=on_tail,
+						)
+					finally:
+						if hasattr(stream_obj, 'close'):
+							stream_obj.close()
+
+				def build_final(full_text: str, tail_body: Optional[dict]) -> RAGResponse:
+					# Merge headers + whatever tail body we managed to capture.
+					final_metrics = self._extract_metrics_from_response(
+						resp,
+						tail_body if isinstance(tail_body, dict) else None,
+					)
+					return RAGResponse(
+						text=full_text,
+						stream=True,
+						metrics=final_metrics,
+						raw_response=tail_body if isinstance(tail_body, dict) else None,
+					)
+
+				stream = RAGStream(
+					iterator_factory=iterator_factory,
+					header_metrics=header_metrics,
+					build_final=build_final,
+				)
+				stream_ref['stream'] = stream
+				return stream
+
+			except Exception:
+				log.debug('converse_stream failed; falling back.', exc_info=True)
+
+		# 2) Fallback invoke_model_with_response_stream (Claude message format)
+		user_text = f'{rag_instructions}\nContext:\n{ctx}\n'
+		if question:
+			user_text += f'\nQuestion:\n{question}\n'
+
+		body: Dict[str, Any] = {
+			'anthropic_version': 'bedrock-2023-05-31',
+			'system': system_prompt,
+			'messages': [{'role': 'user', 'content': [{'type': 'text', 'text': user_text}]}],
+			'max_tokens': max_tokens,
+			'temperature': temperature,
+		}
+		if extra_params:
+			body.update(extra_params)
+
+		resp = self._call_with_refresh(
+			self.bedrock_runtime.invoke_model_with_response_stream,
+			modelId=selected_model,
+			body=json.dumps(body),
+		)
+		event_stream = resp.get('body')
+		if event_stream is None:
+			raise RuntimeError("invoke_model_with_response_stream response missing 'body'")
+
+		header_metrics = self._extract_metrics_from_response(resp, None)
+
+		stream_ref2: Dict[str, RAGStream] = {}
+
+		def iterator_factory2() -> Iterator[str]:
+			on_tail = _make_on_tail(stream_ref2)
+			try:
+				yield from iter_bedrock_stream_text_gen_with_tail(
+					event_stream,
+					on_tail=on_tail,
+				)
+			finally:
+				if hasattr(event_stream, 'close'):
+					event_stream.close()
+
+		def build_final2(full_text: str, tail_body: Optional[dict]) -> RAGResponse:
+			final_metrics = self._extract_metrics_from_response(
+				resp,
+				tail_body if isinstance(tail_body, dict) else None,
+			)
+			return RAGResponse(
+				text=full_text,
+				stream=True,
+				metrics=final_metrics,
+				raw_response=tail_body if isinstance(tail_body, dict) else None,
+			)
+
+		stream2 = RAGStream(
+			iterator_factory=iterator_factory2,
+			header_metrics=header_metrics,
+			build_final=build_final2,
+		)
+		stream_ref2['stream'] = stream2
+		return stream2
+
+	# ------------------------------------------------------------------
 	# Async wrappers for RAG
 	# ------------------------------------------------------------------
 
 	async def async_generate_with_rag(self, **kwargs: Any) -> RAGResponse:
 		return await asyncio.to_thread(self.generate_with_rag, **kwargs)
 
-	async def async_stream_generate_with_rag(self, **kwargs: Any) -> AsyncIterator[str]:
-		kwargs = dict(kwargs)
-		kwargs['stream'] = True
+	async def async_stream_with_rag(
+		self,
+		**kwargs: Any,
+	) -> Tuple[AsyncIterator[str], InvocationMetrics, 'asyncio.Future[RAGResponse]']:
+		"""
+		Returns:
+		  (async_iterator_of_text, header_metrics, result_future)
 
+		- The iterator yields deltas for live streaming.
+		- header_metrics are extracted immediately (best-effort).
+		- result_future resolves to a final RAGResponse after streaming completes
+		  (full text + best-effort final metrics).
+		"""
+		kwargs = dict(kwargs)
 		loop = asyncio.get_running_loop()
+
 		q: asyncio.Queue[Optional[str]] = asyncio.Queue()
 		err: Dict[str, BaseException] = {}
+		header_metrics_holder: Dict[str, InvocationMetrics] = {}
+
+		# This future completes when the stream finishes (or errors).
+		result_future: asyncio.Future[RAGResponse] = loop.create_future()
 
 		def push_text(t: str) -> None:
 			loop.call_soon_threadsafe(q.put_nowait, t)
@@ -654,35 +744,15 @@ class BedrockHelper:
 		def push_error(e: BaseException) -> None:
 			err['exc'] = e
 			loop.call_soon_threadsafe(q.put_nowait, None)
+			loop.call_soon_threadsafe(_set_future_exception_safe, result_future, e)
 
-		RESERVED_KEYS = {
-			'system_prompt',
-			'context',
-			'include_headers_in_context',
-			'question',
-			'model_id',
-			'stream',
-			'temperature',
-			'max_tokens',
-			'max_context_chars',
-			'prefer_converse',
-			'rag_instructions',
-		}
+		def _set_future_result_safe(fut: asyncio.Future[RAGResponse], value: RAGResponse) -> None:
+			if not fut.done():
+				fut.set_result(value)
 
-		def extra_params_from_kwargs(d: Dict[str, Any]) -> Dict[str, Any]:
-			return {k: v for k, v in d.items() if k not in RESERVED_KEYS}
-
-		def normalize_context_value(
-			context_value: Union[str, Sequence[str]],
-			*,
-			include_headers_in_context: bool,
-			max_context_chars: Optional[int],
-		) -> str:
-			if isinstance(context_value, str):
-				ctx = context_value
-			else:
-				ctx = format_context_passages(list(context_value), include_headers=include_headers_in_context)
-			return truncate_by_chars(ctx, max_context_chars)
+		def _set_future_exception_safe(fut: asyncio.Future[RAGResponse], e: BaseException) -> None:
+			if not fut.done():
+				fut.set_exception(e)
 
 		def _worker() -> None:
 			acquired = False
@@ -690,87 +760,18 @@ class BedrockHelper:
 				self._stream_sema.acquire()
 				acquired = True
 
-				selected_model = kwargs.get('model_id') or self.rag_model_id
-				system_prompt = kwargs['system_prompt']
-				context_value = kwargs['context']
-				include_headers_in_context = kwargs.get('include_headers_in_context', False)
-				question = kwargs['question']
+				stream = self.stream_with_rag(**kwargs)
 
-				temperature = kwargs.get('temperature', 0.1)
-				max_tokens = kwargs.get('max_tokens', 1024)
-				max_context_chars = kwargs.get('max_context_chars', 120_000)
-				prefer_converse = kwargs.get('prefer_converse', True)
-				rag_instructions = kwargs.get('rag_instructions', '')
+				# expose header metrics immediately
+				header_metrics_holder['metrics'] = stream.header_metrics
 
-				ctx = normalize_context_value(
-					context_value,
-					include_headers_in_context=include_headers_in_context,
-					max_context_chars=max_context_chars,
-				)
+				# stream deltas
+				for t in stream:
+					push_text(t)
 
-				extra_params = extra_params_from_kwargs(kwargs)
-
-				# 1) Prefer converse_stream
-				if prefer_converse and hasattr(self.bedrock_runtime, 'converse_stream'):
-					try:
-						req = build_converse_request(
-							model_id=selected_model,
-							system_prompt=system_prompt,
-							context=ctx,
-							question=question,
-							max_tokens=max_tokens,
-							temperature=temperature,
-							rag_instructions=rag_instructions,
-							**extra_params,
-						)
-						resp = self._call_with_refresh(self.bedrock_runtime.converse_stream, **req)
-						stream_obj = resp.get('stream')
-						if stream_obj is None:
-							raise RuntimeError("converse_stream response missing 'stream'")
-
-						try:
-							iter_bedrock_stream_text(stream_obj, on_text=push_text, stream_kind='converse')
-						finally:
-							if hasattr(stream_obj, 'close'):
-								stream_obj.close()
-
-						push_done()
-						return
-					except Exception:
-						log.debug('converse_stream failed; falling back.', exc_info=True)
-
-				# 2) Fallback invoke_model_with_response_stream (Claude message format)
-				prefix = ''
-				if isinstance(rag_instructions, str) and rag_instructions.strip():
-					prefix = rag_instructions.strip() + '\n'
-				user_text = f'{prefix}Context:\n{ctx}\n'
-				if question:
-					user_text += f'\nQuestion:\n{question}\n'
-
-				body: Dict[str, Any] = {
-					'anthropic_version': 'bedrock-2023-05-31',
-					'system': system_prompt,
-					'messages': [{'role': 'user', 'content': [{'type': 'text', 'text': user_text}]}],
-					'max_tokens': max_tokens,
-					'temperature': temperature,
-				}
-				if extra_params:
-					body.update(extra_params)
-
-				resp = self._call_with_refresh(
-					self.bedrock_runtime.invoke_model_with_response_stream,
-					modelId=selected_model,
-					body=json.dumps(body),
-				)
-				event_stream = resp.get('body')
-				if event_stream is None:
-					raise RuntimeError("invoke_model_with_response_stream response missing 'body'")
-
-				try:
-					iter_bedrock_stream_text(event_stream, on_text=push_text, stream_kind='invoke')
-				finally:
-					if hasattr(event_stream, 'close'):
-						event_stream.close()
+				# now stream is finished -> stream.result exists
+				final_resp = stream.result
+				loop.call_soon_threadsafe(_set_future_result_safe, result_future, final_resp)
 
 				push_done()
 
@@ -785,17 +786,26 @@ class BedrockHelper:
 
 		threading.Thread(target=_worker, daemon=True).start()
 
-		while True:
-			item = await q.get()
-			if item is None:
-				break
-			yield item
+		async def _aiter() -> AsyncIterator[str]:
+			while True:
+				item = await q.get()
+				if item is None:
+					break
+				yield item
+			if 'exc' in err:
+				raise err['exc']
+
+		# Wait until worker sets header metrics (or errors)
+		while 'metrics' not in header_metrics_holder and 'exc' not in err:
+			await asyncio.sleep(0)
 
 		if 'exc' in err:
 			raise err['exc']
 
+		return _aiter(), header_metrics_holder['metrics'], result_future
+
 	# ------------------------------------------------------------------
-	# Embeddings
+	# Embeddings (unchanged)
 	# ------------------------------------------------------------------
 
 	def _embed_one(self, record_id: str, text: str) -> Tuple[str, List[float], InvocationMetrics]:
@@ -830,11 +840,18 @@ class BedrockHelper:
 		if not pairs:
 			return EmbeddingResponse(embeddings={}, metrics={})
 
+		if max_workers is None or max_workers <= 1 or len(pairs) == 1:
+			max_workers = 1
+
 		if len(pairs) <= batch_threshold:
 			return self._embed_texts_sync_concurrent(pairs, max_workers=max_workers)
 
 		return self.submit_embedding_batch_job(
-			pairs, s3_bucket=s3_bucket, s3_prefix=s3_prefix, role_arn=role_arn, s3_bucket_owner=s3_bucket_owner
+			pairs,
+			s3_bucket=s3_bucket,
+			s3_prefix=s3_prefix or 'bedrock_batch',
+			role_arn=role_arn,
+			s3_bucket_owner=s3_bucket_owner,
 		)
 
 	def _embed_texts_sync_concurrent(
@@ -868,7 +885,7 @@ class BedrockHelper:
 		return await asyncio.to_thread(self.embed_texts, *args, **kwargs)
 
 	# ------------------------------------------------------------------
-	# Batch embeddings helpers
+	# Batch embeddings helpers (unchanged, but kept in-file for drop-in)
 	# ------------------------------------------------------------------
 
 	def submit_embedding_batch_job(
@@ -909,8 +926,8 @@ class BedrockHelper:
 			output_prefix = f'{s3_prefix}/outputs/{job_uuid}/'
 			output_s3_uri = f's3://{s3_bucket}/{output_prefix}'
 
-			input_config = {'s3InputDataConfig': {'s3Uri': input_s3_uri}}
-			output_config = {'s3OutputDataConfig': {'s3Uri': output_s3_uri}}
+			input_config: Dict[str, Any] = {'s3InputDataConfig': {'s3Uri': input_s3_uri}}
+			output_config: Dict[str, Any] = {'s3OutputDataConfig': {'s3Uri': output_s3_uri}}
 
 			if s3_bucket_owner is not None:
 				input_config['s3InputDataConfig']['s3BucketOwner'] = str(s3_bucket_owner)
