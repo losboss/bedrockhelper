@@ -52,47 +52,122 @@ class TestMakeOnTail(TestCase):
 	def test_no_stream_in_ref(self):
 		stream_ref = {}
 		on_tail = _make_on_tail(stream_ref)
-		on_tail({'usage': {'tokens': 10}})
-		# Should not raise
+		on_tail({'amazon-bedrock-invocationMetrics': {'inputTokenCount': 10}})
 
-	def test_sets_initial_tail_body(self):
+	# Should not raise
+
+	def test_ignores_non_dict_message(self):
 		mock_stream = Mock(spec=RAGStream)
 		stream_ref = {'stream': mock_stream}
 		on_tail = _make_on_tail(stream_ref)
 
-		msg = {'usage': {'tokens': 10}}
+		on_tail('nope')  # type: ignore[arg-type]
+		mock_stream._set_tail_body.assert_not_called()
+
+	def test_sets_initial_tail_body_when_prev_missing(self):
+		mock_stream = Mock(spec=RAGStream)
+		# Ensure getattr(..., "_tail_body", None) returns None
+		if hasattr(mock_stream, '_tail_body'):
+			delattr(mock_stream, '_tail_body')
+
+		stream_ref = {'stream': mock_stream}
+		on_tail = _make_on_tail(stream_ref)
+
+		msg = {'amazon-bedrock-invocationMetrics': {'inputTokenCount': 10}}
 		on_tail(msg)
 		mock_stream._set_tail_body.assert_called_once_with(msg)
 
-	def test_keeps_usage_if_present(self):
+	def test_sets_initial_tail_body_when_prev_not_dict(self):
 		mock_stream = Mock(spec=RAGStream)
-		mock_stream._tail_body = {'usage': {'tokens': 10}}
+		mock_stream._tail_body = 'not a dict'
 		stream_ref = {'stream': mock_stream}
 		on_tail = _make_on_tail(stream_ref)
 
-		on_tail({'other': 'data'})
-		# Should not replace existing usage
-		self.assertEqual(mock_stream._set_tail_body.call_count, 0)
+		msg = {'amazon-bedrock-invocationMetrics': {'inputTokenCount': 10}}
+		on_tail(msg)
+		mock_stream._set_tail_body.assert_called_once_with(msg)
 
-	def test_upgrades_to_usage(self):
+	def test_merges_invocation_metrics(self):
+		mock_stream = Mock(spec=RAGStream)
+		mock_stream._tail_body = {
+			'amazon-bedrock-invocationMetrics': {'inputTokenCount': 10, 'invocationLatency': 111},
+			'other': 'keep-me',
+		}
+		stream_ref = {'stream': mock_stream}
+		on_tail = _make_on_tail(stream_ref)
+
+		new_msg = {'amazon-bedrock-invocationMetrics': {'outputTokenCount': 5}}
+		on_tail(new_msg)
+
+		# Should merge with previous + keep non-metrics fields
+		expected = {
+			'amazon-bedrock-invocationMetrics': {
+				'inputTokenCount': 10,
+				'invocationLatency': 111,
+				'outputTokenCount': 5,
+			},
+			'other': 'keep-me',
+		}
+		mock_stream._set_tail_body.assert_called_once_with(expected)
+
+	def test_invocation_metrics_new_values_override_old(self):
+		mock_stream = Mock(spec=RAGStream)
+		mock_stream._tail_body = {'amazon-bedrock-invocationMetrics': {'inputTokenCount': 10, 'outputTokenCount': 1}}
+		stream_ref = {'stream': mock_stream}
+		on_tail = _make_on_tail(stream_ref)
+
+		new_msg = {'amazon-bedrock-invocationMetrics': {'outputTokenCount': 99}}
+		on_tail(new_msg)
+
+		expected = {'amazon-bedrock-invocationMetrics': {'inputTokenCount': 10, 'outputTokenCount': 99}}
+		mock_stream._set_tail_body.assert_called_once_with(expected)
+
+	def test_replaces_invocation_metrics_when_prev_missing(self):
 		mock_stream = Mock(spec=RAGStream)
 		mock_stream._tail_body = {'other': 'data'}
 		stream_ref = {'stream': mock_stream}
 		on_tail = _make_on_tail(stream_ref)
 
-		new_msg = {'usage': {'tokens': 10}}
+		new_msg = {'amazon-bedrock-invocationMetrics': {'inputTokenCount': 10}}
 		on_tail(new_msg)
-		mock_stream._set_tail_body.assert_called_once_with(new_msg)
 
-	def test_updates_latest_without_usage(self):
+		expected = {
+			'other': 'data',
+			'amazon-bedrock-invocationMetrics': {'inputTokenCount': 10},
+		}
+		mock_stream._set_tail_body.assert_called_once_with(expected)
+
+	def test_keeps_last_seen_type_and_stop_flags(self):
 		mock_stream = Mock(spec=RAGStream)
-		mock_stream._tail_body = {'other': 'old'}
+		mock_stream._tail_body = {
+			'amazon-bedrock-invocationMetrics': {'inputTokenCount': 10},
+			'type': 'message_delta',
+		}
 		stream_ref = {'stream': mock_stream}
 		on_tail = _make_on_tail(stream_ref)
 
-		new_msg = {'other': 'new'}
+		new_msg = {'type': 'message_stop', 'message_stop': True}
 		on_tail(new_msg)
-		mock_stream._set_tail_body.assert_called_once_with(new_msg)
+
+		expected = {
+			'amazon-bedrock-invocationMetrics': {'inputTokenCount': 10},
+			'type': 'message_stop',
+			'message_stop': True,
+		}
+		mock_stream._set_tail_body.assert_called_once_with(expected)
+
+	def test_does_not_add_stop_flags_when_not_present(self):
+		mock_stream = Mock(spec=RAGStream)
+		mock_stream._tail_body = {'amazon-bedrock-invocationMetrics': {'inputTokenCount': 10}}
+		stream_ref = {'stream': mock_stream}
+		on_tail = _make_on_tail(stream_ref)
+
+		on_tail({'other': 'new'})  # no flags, no invocationMetrics
+
+		expected = {
+			'amazon-bedrock-invocationMetrics': {'inputTokenCount': 10},
+		}
+		mock_stream._set_tail_body.assert_called_once_with(expected)
 
 
 class TestBotoSessionManager(TestCase):

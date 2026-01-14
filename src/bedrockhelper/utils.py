@@ -1,3 +1,4 @@
+import ast
 import json
 import threading
 from queue import Queue
@@ -216,6 +217,13 @@ def build_converse_request(
 			'maxTokens': max_tokens,
 			'temperature': temperature,
 		},
+		# Enable usage metrics in streaming responses
+		'performanceConfig': {
+			'latency': 'standard'  # or 'optimized'
+		},
+		# Request additional metadata
+		'additionalModelRequestFields': {},
+		'additionalModelResponseFieldPaths': ['/usage'],
 	}
 
 	# Allow caller to pass model-specific / top-level extra fields.
@@ -234,6 +242,39 @@ def normalize_s3_bucket_name(bucket: str) -> str:
 	if bucket.startswith('s3://'):
 		return bucket[len('s3://') :]
 	return bucket
+
+
+def _decode_bedrock_chunk_bytes(raw: Any, *, decode: str = 'utf-8') -> Optional[str]:
+	"""
+	Bedrock streaming 'chunk.bytes' is usually bytes, but can sometimes appear as:
+	- a str that is already JSON, or
+	- a str that looks like a Python bytes literal: "b'...'"
+	Return decoded text or None if we can't decode.
+	"""
+	if raw is None:
+		return None
+
+	# Normal case: bytes
+	if isinstance(raw, (bytes, bytearray)):
+		return bytes(raw).decode(decode, errors='replace')
+
+	# Sometimes: already-decoded JSON string
+	if isinstance(raw, str):
+		s = raw.strip()
+
+		# If it looks like b'...'
+		if (s.startswith("b'") and s.endswith("'")) or (s.startswith('b"') and s.endswith('"')):
+			try:
+				b = ast.literal_eval(s)  # -> bytes
+				if isinstance(b, (bytes, bytearray)):
+					return bytes(b).decode(decode, errors='replace')
+			except Exception:
+				return None
+
+		# Otherwise assume it's JSON text already
+		return s
+
+	return None
 
 
 def _iter_stream_with_callback(event_stream, *, stream_kind: str) -> Iterator[str]:
@@ -306,10 +347,11 @@ def iter_bedrock_stream_text_gen_with_tail(
 		# INVOKE shape: {"chunk": {"bytes": b"...json..."}}
 		if 'chunk' in event_item and isinstance(event_item.get('chunk'), dict):
 			raw = event_item['chunk'].get('bytes')
-			if not raw:
+			text = _decode_bedrock_chunk_bytes(raw, decode=decode)
+			if not text:
 				continue
 			try:
-				msg = json.loads(raw.decode(decode))
+				msg = json.loads(text)
 			except Exception:
 				continue
 

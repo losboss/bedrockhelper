@@ -209,26 +209,34 @@ def _is_expired_token(err: BaseException) -> bool:
 def _make_on_tail(stream_ref: Dict[str, RAGStream]) -> Callable[[dict], None]:
 	def on_tail(msg: dict) -> None:
 		s = stream_ref.get('stream')
-		if s is None:
+		if s is None or not isinstance(msg, dict):
 			return
 
-		# Prefer tails that include 'usage' (best for cost estimation).
 		prev = getattr(s, '_tail_body', None)
+
+		# First tail -> set
 		if not isinstance(prev, dict):
 			s._set_tail_body(msg)
 			return
 
-		# If we already have usage, keep it.
-		if 'usage' in prev:
-			return
+		merged = dict(prev)
 
-		# If new msg has usage, upgrade.
-		if 'usage' in msg:
-			s._set_tail_body(msg)
-			return
+		# Merge invocationMetrics (preferred)
+		prev_inv = prev.get('amazon-bedrock-invocationMetrics')
+		new_inv = msg.get('amazon-bedrock-invocationMetrics')
+		if isinstance(prev_inv, dict) and isinstance(new_inv, dict):
+			m = dict(prev_inv)
+			m.update(new_inv)  # new keys override old keys
+			merged['amazon-bedrock-invocationMetrics'] = m
+		elif isinstance(new_inv, dict):
+			merged['amazon-bedrock-invocationMetrics'] = new_inv
 
-		# Otherwise keep latest (helps catch messageStop etc.)
-		s._set_tail_body(msg)
+		# Keep last-seen type/stop flags if present (optional)
+		for k in ('type', 'messageStop', 'message_stop'):
+			if k in msg:
+				merged[k] = msg[k]
+
+		s._set_tail_body(merged)
 
 	return on_tail
 
@@ -381,10 +389,37 @@ class BedrockHelper:
 						pass
 
 			# Some responses embed invocation metrics under this key
-			inv = response_body.get('amazon-bedrock-invocationMetrics')
-			if isinstance(inv, dict):
-				metrics.invocation_latency_ms = inv.get('invocationLatency') or metrics.invocation_latency_ms
-				metrics.first_byte_latency_ms = inv.get('firstByteLatency') or metrics.first_byte_latency_ms
+			if response_body:
+				inv = response_body.get('amazon-bedrock-invocationMetrics')
+				if isinstance(inv, dict):
+					# Tail-preferred: overwrite if present
+					itc = inv.get('inputTokenCount')
+					if itc is not None:
+						try:
+							metrics.input_tokens = int(itc)
+						except (TypeError, ValueError):
+							pass
+
+					otc = inv.get('outputTokenCount')
+					if otc is not None:
+						try:
+							metrics.output_tokens = int(otc)
+						except (TypeError, ValueError):
+							pass
+
+					il = inv.get('invocationLatency')
+					if il is not None:
+						try:
+							metrics.invocation_latency_ms = int(il)
+						except (TypeError, ValueError):
+							pass
+
+					fb = inv.get('firstByteLatency')
+					if fb is not None:
+						try:
+							metrics.first_byte_latency_ms = int(fb)
+						except (TypeError, ValueError):
+							pass
 
 		# ---- Header metrics
 		http_headers = response.get('ResponseMetadata', {}).get('HTTPHeaders', {}) or {}
