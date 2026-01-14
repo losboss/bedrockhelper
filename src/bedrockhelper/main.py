@@ -412,12 +412,12 @@ class BedrockHelper:
 		system_prompt: str,
 		context: Union[str, Sequence[str]],
 		include_headers_in_context: bool = False,
-		question: str,
+		question: Optional[str] = '',  # if its not provided, assume it's in system_prompt
 		model_id: Optional[str] = None,
 		stream: bool = False,
 		temperature: float = 0.1,
-		max_tokens: int = 1024,
-		max_context_chars: Optional[int] = 120_000,
+		max_tokens: int = 8192,
+		max_context_chars: Optional[int] = 150_000,
 		prefer_converse: bool = True,
 		rag_instructions: str = '',
 		**extra_params: Any,
@@ -559,7 +559,9 @@ class BedrockHelper:
 		rag_instructions: str = '',
 		**extra_params: Any,
 	) -> RAGResponse:
-		user_text = f'{rag_instructions}\nContext:\n{context}\n\nQuestion:\n{question}\n'
+		user_text = f'{rag_instructions}\nContext:\n{context}\n'
+		if question:
+			user_text += f'\nQuestion:\n{question}\n'
 
 		request_body: Dict[str, Any] = {
 			'anthropic_version': 'bedrock-2023-05-31',
@@ -741,7 +743,9 @@ class BedrockHelper:
 				prefix = ''
 				if isinstance(rag_instructions, str) and rag_instructions.strip():
 					prefix = rag_instructions.strip() + '\n'
-				user_text = f'{prefix}Context:\n{ctx}\n\nQuestion:\n{question}\n'
+				user_text = f'{prefix}Context:\n{ctx}\n'
+				if question:
+					user_text += f'\nQuestion:\n{question}\n'
 
 				body: Dict[str, Any] = {
 					'anthropic_version': 'bedrock-2023-05-31',

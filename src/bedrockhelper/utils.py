@@ -191,7 +191,10 @@ def build_converse_request(
 	"""
 	Build the shared request payload for converse() and converse_stream().
 	"""
-	user_text = f'Context:\n{context}\n\nQuestion:\n{question}\n'
+
+	user_text = f'Context:\n{context}\n'
+	if question:
+		user_text += f'\nQuestion:\n{question}\n'
 	if rag_instructions:
 		user_text = f'{rag_instructions}\n{user_text}'
 
