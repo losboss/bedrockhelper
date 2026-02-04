@@ -2,6 +2,7 @@ import json
 from unittest import TestCase
 
 from bedrockhelper.utils import (
+	_decode_bedrock_chunk_bytes,
 	_iter_stream_with_callback,
 	build_converse_request,
 	extract_converse_text,
@@ -556,3 +557,99 @@ class TestIterBedrockStreamTextGenWithTail(TestCase):
 		captured = []
 		list(iter_bedrock_stream_text_gen_with_tail(events, on_tail=captured.append))
 		self.assertEqual(len(captured), 0)
+
+
+class TestDecodeBedrockChunkBytes(TestCase):
+	def test_none_returns_none(self):
+		self.assertIsNone(_decode_bedrock_chunk_bytes(None))
+
+	def test_bytes_decoded(self):
+		result = _decode_bedrock_chunk_bytes(b'hello world')
+		self.assertEqual(result, 'hello world')
+
+	def test_bytearray_decoded(self):
+		result = _decode_bedrock_chunk_bytes(bytearray(b'hello'))
+		self.assertEqual(result, 'hello')
+
+	def test_string_returned_as_is(self):
+		result = _decode_bedrock_chunk_bytes('{"text": "hello"}')
+		self.assertEqual(result, '{"text": "hello"}')
+
+	def test_bytes_literal_string_single_quotes(self):
+		# String that looks like b'...'
+		result = _decode_bedrock_chunk_bytes("b'hello'")
+		self.assertEqual(result, 'hello')
+
+	def test_bytes_literal_string_double_quotes(self):
+		# String that looks like b"..."
+		result = _decode_bedrock_chunk_bytes('b"hello"')
+		self.assertEqual(result, 'hello')
+
+	def test_malformed_bytes_literal_returns_as_string(self):
+		# Malformed bytes literal (doesn't end with quote) - treated as regular string
+		result = _decode_bedrock_chunk_bytes("b'invalid")
+		self.assertEqual(result, "b'invalid")
+
+	def test_invalid_bytes_literal_eval_returns_none(self):
+		# Looks like bytes literal but ast.literal_eval fails (lines 271-272)
+		result = _decode_bedrock_chunk_bytes("b'\\x'")  # Invalid escape sequence
+		self.assertIsNone(result)
+
+	def test_unsupported_type_returns_none(self):
+		result = _decode_bedrock_chunk_bytes(12345)
+		self.assertIsNone(result)
+
+	def test_bytes_literal_eval_non_bytes_returns_none(self):
+		# ast.literal_eval returns something that's not bytes
+		result = _decode_bedrock_chunk_bytes("b'\\x80\\x81'")  # Valid bytes literal
+		self.assertIsNotNone(result)
+
+
+class TestIterBedrockStreamTextEdgeCases(TestCase):
+	def test_invoke_non_dict_json_skipped(self):
+		# JSON parses to non-dict (line 45 in utils.py)
+		events = [
+			{'chunk': {'bytes': json.dumps(['array', 'not', 'dict']).encode('utf-8')}},
+			{'chunk': {'bytes': json.dumps({'delta': {'text': 'ok'}}).encode('utf-8')}},
+		]
+		texts = []
+		iter_bedrock_stream_text(events, on_text=texts.append, stream_kind='invoke')
+		self.assertEqual(texts, ['ok'])
+
+	def test_invoke_chunk_with_none_bytes_skipped(self):
+		# chunk exists but bytes is None (line 38 in utils.py)
+		events = [
+			{'chunk': {'bytes': None}},
+			{'chunk': {'bytes': json.dumps({'delta': {'text': 'ok'}}).encode('utf-8')}},
+		]
+		texts = []
+		iter_bedrock_stream_text(events, on_text=texts.append, stream_kind='invoke')
+		self.assertEqual(texts, ['ok'])
+
+	def test_converse_message_stop_dict_stops(self):
+		# messageStop is a dict (line 72 in utils.py)
+		events = [
+			{'contentBlockDelta': {'delta': {'text': 'hello'}}},
+			{'message_stop': {'stopReason': 'end_turn'}},
+			{'contentBlockDelta': {'delta': {'text': 'ignored'}}},
+		]
+		texts = []
+		iter_bedrock_stream_text(events, on_text=texts.append, stream_kind='converse')
+		self.assertEqual(texts, ['hello'])
+
+	def test_converse_message_stop_dict_without_stop_key(self):
+		# messageStop dict stops via line 72 when not in converse_stop_keys
+		events = [
+			{'contentBlockDelta': {'delta': {'text': 'hello'}}},
+			{'messageStop': {'stopReason': 'end_turn'}},
+			{'contentBlockDelta': {'delta': {'text': 'ignored'}}},
+		]
+		texts = []
+		# Use custom stop keys that don't include messageStop
+		iter_bedrock_stream_text(
+			events,
+			on_text=texts.append,
+			stream_kind='converse',
+			converse_stop_keys=('custom_stop',),
+		)
+		self.assertEqual(texts, ['hello'])

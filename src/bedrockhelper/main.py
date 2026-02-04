@@ -38,8 +38,11 @@ from typing import (
 	Optional,
 	Sequence,
 	Tuple,
+	TypeVar,
 	Union,
 )
+
+_T = TypeVar('_T')
 
 import boto3
 from botocore.config import Config
@@ -169,7 +172,7 @@ class _BotoSessionManager:
 		)
 
 		# Attach refreshable creds to botocore session.
-		bc._credentials = refreshable  # noqa: SLF001
+		bc._credentials = refreshable  # type: ignore[attr-defined]  # noqa: SLF001
 		bc.set_credentials(refreshable.access_key, refreshable.secret_key, refreshable.token)
 
 		return boto3.Session(botocore_session=bc, region_name=self._region)
@@ -185,7 +188,7 @@ class _BotoSessionManager:
 		with self._lock:
 			sess = self._ensure_session()
 			if service_name not in self._clients:
-				self._clients[service_name] = sess.client(
+				self._clients[service_name] = sess.client(  # type: ignore[call-overload]
 					service_name,
 					region_name=self._region,
 					config=self._cfg,
@@ -206,8 +209,8 @@ def _is_expired_token(err: BaseException) -> bool:
 	return False
 
 
-def _make_on_tail(stream_ref: Dict[str, RAGStream]) -> Callable[[dict], None]:
-	def on_tail(msg: dict) -> None:
+def _make_on_tail(stream_ref: Dict[str, RAGStream]) -> Callable[[dict[str, Any]], None]:
+	def on_tail(msg: dict[str, Any]) -> None:
 		s = stream_ref.get('stream')
 		if s is None or not isinstance(msg, dict):
 			return
@@ -221,7 +224,7 @@ def _make_on_tail(stream_ref: Dict[str, RAGStream]) -> Callable[[dict], None]:
 
 		merged = dict(prev)
 
-		# Merge invocationMetrics (preferred)
+		# Merge invocationMetrics
 		prev_inv = prev.get('amazon-bedrock-invocationMetrics')
 		new_inv = msg.get('amazon-bedrock-invocationMetrics')
 		if isinstance(prev_inv, dict) and isinstance(new_inv, dict):
@@ -231,7 +234,7 @@ def _make_on_tail(stream_ref: Dict[str, RAGStream]) -> Callable[[dict], None]:
 		elif isinstance(new_inv, dict):
 			merged['amazon-bedrock-invocationMetrics'] = new_inv
 
-		# Keep last-seen type/stop flags if present (optional)
+		# Keep last-seen type/stop flags if present
 		for k in ('type', 'messageStop', 'message_stop'):
 			if k in msg:
 				merged[k] = msg[k]
@@ -264,7 +267,6 @@ class BedrockHelper:
 		embedding_model_id: Optional[str] = None,
 		*,
 		botocore_config: Optional[Config] = None,
-		# assume role (optional)
 		role_arn: Optional[str] = os.getenv('AWS_ROLE_ARN'),
 		role_session_name: str = os.getenv('AWS_ROLE_SESSION_NAME', 'bedrockhelper'),
 		external_id: Optional[str] = os.getenv('AWS_EXTERNAL_ID'),
@@ -325,7 +327,7 @@ class BedrockHelper:
 		if not self._injected['s3']:
 			self.s3 = self._session_mgr.client('s3')
 
-	def _call_with_refresh(self, fn, *args, **kwargs):
+	def _call_with_refresh(self, fn: Callable[..., _T], *args: Any, **kwargs: Any) -> _T:
 		try:
 			return fn(*args, **kwargs)
 		except BaseException as e:
@@ -343,8 +345,8 @@ class BedrockHelper:
 	@classmethod
 	def _extract_metrics_from_response(
 		cls,
-		response: dict,
-		response_body: Optional[dict] = None,
+		response: dict[str, Any],
+		response_body: Optional[dict[str, Any]] = None,
 	) -> InvocationMetrics:
 		metrics = InvocationMetrics()
 
@@ -657,7 +659,7 @@ class BedrockHelper:
 						if hasattr(stream_obj, 'close'):
 							stream_obj.close()
 
-				def build_final(full_text: str, tail_body: Optional[dict]) -> RAGResponse:
+				def build_final(full_text: str, tail_body: Optional[dict[str, Any]]) -> RAGResponse:
 					# Merge headers + whatever tail body we managed to capture.
 					final_metrics = self._extract_metrics_from_response(
 						resp,
@@ -720,7 +722,7 @@ class BedrockHelper:
 				if hasattr(event_stream, 'close'):
 					event_stream.close()
 
-		def build_final2(full_text: str, tail_body: Optional[dict]) -> RAGResponse:
+		def build_final2(full_text: str, tail_body: Optional[dict[str, Any]]) -> RAGResponse:
 			final_metrics = self._extract_metrics_from_response(
 				resp,
 				tail_body if isinstance(tail_body, dict) else None,
@@ -840,7 +842,7 @@ class BedrockHelper:
 		return _aiter(), header_metrics_holder['metrics'], result_future
 
 	# ------------------------------------------------------------------
-	# Embeddings (unchanged)
+	# Embeddings
 	# ------------------------------------------------------------------
 
 	def _embed_one(self, record_id: str, text: str) -> Tuple[str, List[float], InvocationMetrics]:
@@ -920,7 +922,7 @@ class BedrockHelper:
 		return await asyncio.to_thread(self.embed_texts, *args, **kwargs)
 
 	# ------------------------------------------------------------------
-	# Batch embeddings helpers (unchanged, but kept in-file for drop-in)
+	# Batch embeddings helpers
 	# ------------------------------------------------------------------
 
 	def submit_embedding_batch_job(
@@ -940,7 +942,7 @@ class BedrockHelper:
 		s3_bucket = normalize_s3_bucket_name(s3_bucket)
 
 		if not isinstance(pairs, list) or (pairs and not isinstance(pairs[0], tuple)):
-			pairs = normalize_records(pairs)  # type: ignore[assignment]
+			pairs = normalize_records(pairs)
 
 		job_uuid = uuid.uuid4().hex
 		job_name = f'bedrock-embedding-job-{job_uuid}'
@@ -998,7 +1000,7 @@ class BedrockHelper:
 				except OSError:
 					pass
 
-	def get_batch_job(self, job_id: str) -> dict:
+	def get_batch_job(self, job_id: str) -> dict[str, Any]:
 		return self._call_with_refresh(self.bedrock.get_model_invocation_job, jobIdentifier=job_id)
 
 	def wait_for_batch_job(
@@ -1007,7 +1009,7 @@ class BedrockHelper:
 		*,
 		poll_seconds: float = 10.0,
 		timeout_seconds: float = 3600.0,
-	) -> dict:
+	) -> dict[str, Any]:
 		deadline = time.time() + timeout_seconds
 		while True:
 			info = self.get_batch_job(job_id)
@@ -1018,7 +1020,7 @@ class BedrockHelper:
 				raise TimeoutError(f'Batch job did not complete within {timeout_seconds}s (status={status})')
 			time.sleep(poll_seconds)
 
-	def download_batch_results_jsonl(self, *, output_s3_uri: str) -> Iterator[dict]:
+	def download_batch_results_jsonl(self, *, output_s3_uri: str) -> Iterator[dict[str, Any]]:
 		if not output_s3_uri.startswith('s3://'):
 			raise ValueError('output_s3_uri must start with s3://')
 

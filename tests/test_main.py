@@ -338,6 +338,50 @@ class TestExtractMetricsFromResponse(TestCase):
 		self.assertIsNone(metrics.input_tokens)
 		self.assertIsNone(metrics.output_tokens)
 
+	def test_invalid_input_text_token_count_ignored(self):
+		# Tests line 391-392: TypeError/ValueError in inputTextTokenCount
+		response = {'ResponseMetadata': {'HTTPHeaders': {}}}
+		body = {'inputTextTokenCount': 'not-a-number'}
+
+		metrics = BedrockHelper._extract_metrics_from_response(response, body)
+
+		self.assertIsNone(metrics.input_tokens)
+
+	def test_invalid_invocation_metrics_values_ignored(self):
+		# Tests lines 401-425: TypeError/ValueError in invocation metrics
+		response = {'ResponseMetadata': {'HTTPHeaders': {}}}
+		body = {
+			'amazon-bedrock-invocationMetrics': {
+				'inputTokenCount': 'bad',
+				'outputTokenCount': [],
+				'invocationLatency': {},
+				'firstByteLatency': 'not-a-number',
+			}
+		}
+
+		metrics = BedrockHelper._extract_metrics_from_response(response, body)
+
+		self.assertIsNone(metrics.input_tokens)
+		self.assertIsNone(metrics.output_tokens)
+		self.assertIsNone(metrics.invocation_latency_ms)
+		self.assertIsNone(metrics.first_byte_latency_ms)
+
+	def test_invalid_header_values_ignored(self):
+		# Tests lines 438-440: TypeError/ValueError in header parsing
+		response = {
+			'ResponseMetadata': {
+				'HTTPHeaders': {
+					'x-amzn-bedrock-input-token-count': 'not-a-number',
+					'x-amzn-bedrock-output-token-count': [],
+				}
+			}
+		}
+
+		metrics = BedrockHelper._extract_metrics_from_response(response, None)
+
+		self.assertIsNone(metrics.input_tokens)
+		self.assertIsNone(metrics.output_tokens)
+
 
 class TestGenerateWithRAG(TestCase):
 	def setUp(self):

@@ -1,5 +1,10 @@
+from __future__ import annotations
+
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterator, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional, Union
+
+if TYPE_CHECKING:
+	from bedrockhelper.batch.models import BatchJobRef
 
 _TERMINAL_STATUSES = {'Completed', 'Failed', 'Stopped', 'Expired'}
 _SUCCESS_STATUSES = {'Completed'}
@@ -34,7 +39,7 @@ class RAGResponse:
 	text: str
 	stream: bool
 	metrics: InvocationMetrics
-	raw_response: Optional[dict] = None
+	raw_response: Optional[dict[str, Any]] = None
 
 
 class RAGStream:
@@ -48,14 +53,14 @@ class RAGStream:
 		*,
 		iterator_factory: Callable[[], Iterator[str]],
 		header_metrics: InvocationMetrics,
-		build_final: Callable[[str, Optional[dict]], RAGResponse],
+		build_final: Callable[[str, Optional[dict[str, Any]]], RAGResponse],
 	) -> None:
 		self._iterator_factory = iterator_factory
 		self.header_metrics = header_metrics
 		self._build_final = build_final
 
 		self._chunks: List[str] = []
-		self._tail_body: Optional[dict] = None
+		self._tail_body: Optional[dict[str, Any]] = None
 		self._result: Optional[RAGResponse] = None
 		self._consumed = False
 
@@ -87,7 +92,7 @@ class RAGStream:
 		return self._result
 
 	# internal hook
-	def _set_tail_body(self, tail: dict) -> None:
+	def _set_tail_body(self, tail: dict[str, Any]) -> None:
 		self._tail_body = tail
 
 

@@ -1,4 +1,3 @@
-import unittest
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
 from unittest import TestCase

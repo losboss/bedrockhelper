@@ -2,6 +2,7 @@ from unittest import TestCase
 
 from bedrockhelper.batch.models import BatchJobRef
 from bedrockhelper import BatchJobResponse
+from bedrockhelper.models import InvocationMetrics, RAGResponse, RAGStream
 
 
 class TestBatchJobResponse(TestCase):
@@ -64,3 +65,56 @@ class TestBatchJobRefConversion(TestCase):
 		self.assertEqual(ref.model_id, 'my-model')
 		self.assertEqual(ref.input_s3_uri, 's3://input')
 		self.assertEqual(ref.output_s3_uri, 's3://output')
+
+
+class TestRAGStream(TestCase):
+	def _make_stream(self, chunks: list[str]) -> RAGStream:
+		"""Helper to create a RAGStream with given chunks."""
+		header_metrics = InvocationMetrics(input_tokens=10)
+
+		def iterator_factory():
+			yield from chunks
+
+		def build_final(full_text: str, tail_body):
+			return RAGResponse(
+				text=full_text,
+				stream=True,
+				metrics=InvocationMetrics(input_tokens=10, output_tokens=len(full_text)),
+				raw_response=tail_body,
+			)
+
+		return RAGStream(
+			iterator_factory=iterator_factory,
+			header_metrics=header_metrics,
+			build_final=build_final,
+		)
+
+	def test_metrics_property_returns_header_metrics(self):
+		stream = self._make_stream(['hello'])
+		# Access metrics property before iteration (line 73)
+		self.assertEqual(stream.metrics.input_tokens, 10)
+
+	def test_double_iteration_raises_error(self):
+		stream = self._make_stream(['hello', ' world'])
+		# First iteration succeeds
+		list(stream)
+		# Second iteration raises (line 77)
+		with self.assertRaises(RuntimeError) as ctx:
+			list(stream)
+		self.assertIn('only be iterated once', str(ctx.exception))
+
+	def test_result_before_iteration_raises_error(self):
+		stream = self._make_stream(['hello'])
+		# Access result before iteration (line 91)
+		with self.assertRaises(RuntimeError) as ctx:
+			_ = stream.result
+		self.assertIn('not finished yet', str(ctx.exception))
+
+	def test_set_tail_body(self):
+		stream = self._make_stream(['hello'])
+		# Set tail body before iteration
+		stream._set_tail_body({'usage': {'tokens': 5}})
+		# Iterate to completion
+		list(stream)
+		# Result should have the tail body
+		self.assertEqual(stream.result.raw_response, {'usage': {'tokens': 5}})

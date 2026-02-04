@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Callable, Dict, List, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Tuple
 
 from .store import JobStore
 from .models import BatchJobRef
 from bedrockhelper.models import BatchJobResponse
 
-ProcessEmbeddingsFn = Callable[[BatchJobResponse, Dict[str, List[float]]], None]
+if TYPE_CHECKING:
+	from bedrockhelper.main import BedrockHelper
+
+ProcessEmbeddingsFn = Callable[[BatchJobRef, Dict[str, List[float]]], None]
 
 
 def state_from_bedrock_status(status: str) -> str:
@@ -16,9 +19,6 @@ def state_from_bedrock_status(status: str) -> str:
 	if status in ('Failed', 'Stopped', 'Expired'):
 		return 'FAILED'
 	return 'RUNNING'
-
-
-ProcessEmbeddingsFn = Callable[[BatchJobRef, Dict[str, List[float]]], None]
 
 
 def reconcile_batch_embedding_jobs(

@@ -13,7 +13,7 @@ _SENTINEL = object()
 
 
 def iter_bedrock_stream_text(
-	event_stream: Iterable[dict],
+	event_stream: Iterable[dict[str, Any]],
 	*,
 	on_text: Callable[[str], None],
 	stream_kind: str = 'auto',
@@ -23,11 +23,9 @@ def iter_bedrock_stream_text(
 ) -> None:
 	"""
 	Iterate a Bedrock streaming event stream and call `on_text(...)` for each text delta.
-
-	(docstring trimmed for brevity)
 	"""
 
-	def _handle_invoke_event(event: dict) -> bool:
+	def _handle_invoke_event(event: dict[str, Any]) -> bool:
 		# Returns True if should stop
 		chunk = event.get('chunk')
 		if not chunk:
@@ -53,7 +51,7 @@ def iter_bedrock_stream_text(
 			return True
 		return False
 
-	def _handle_converse_event(event: dict) -> bool:
+	def _handle_converse_event(event: dict[str, Any]) -> bool:
 		# Returns True if should stop
 		cbd = event.get('contentBlockDelta') or event.get('content_block_delta')
 		if isinstance(cbd, dict):
@@ -167,7 +165,7 @@ def normalize_records(records: RecordInput) -> List[Tuple[str, str]]:
 	return out
 
 
-def extract_converse_text(resp: dict) -> str:
+def extract_converse_text(resp: dict[str, Any]) -> str:
 	"""
 	Extract final assistant text from a Bedrock converse() response.
 	"""
@@ -277,13 +275,13 @@ def _decode_bedrock_chunk_bytes(raw: Any, *, decode: str = 'utf-8') -> Optional[
 	return None
 
 
-def _iter_stream_with_callback(event_stream, *, stream_kind: str) -> Iterator[str]:
+def _iter_stream_with_callback(event_stream: Iterable[dict[str, Any]], *, stream_kind: str) -> Iterator[str]:
 	"""
 	Adapt iter_bedrock_stream_text(callback-based) into an Iterator[str].
 	Ensures the underlying stream is closed when the iterator ends.
 	"""
 	q: 'Queue[object]' = Queue()
-	err: Dict[str, BaseException] = {}
+	err: dict[str, BaseException] = {}
 
 	def on_text(t: str) -> None:
 		q.put(t)
@@ -306,17 +304,18 @@ def _iter_stream_with_callback(event_stream, *, stream_kind: str) -> Iterator[st
 		item = q.get()
 		if item is _SENTINEL:
 			break
-		yield item  # str
+		assert isinstance(item, str)
+		yield item
 
 	if 'exc' in err:
 		raise err['exc']
 
 
 def iter_bedrock_stream_text_gen_with_tail(
-	event_stream: Iterable[dict],
+	event_stream: Iterable[dict[str, Any]],
 	*,
 	decode: str = 'utf-8',
-	on_tail: Callable[[dict], None],
+	on_tail: Callable[[dict[str, Any]], None],
 ) -> Iterator[str]:
 	"""
 	Yield text deltas. Best-effort: whenever we parse a JSON message that contains
