@@ -1,6 +1,6 @@
 # Changelog
 
-## [1.0.0](https://github.com/losboss/bedrockhelper/commits/main) (2026-02-05)
+## [1.0.2](https://github.com/losboss/bedrockhelper/commits/main) (2026-02-05)
 
 ### Features
 
