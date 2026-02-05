@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.0](https://github.com/losboss/bedrockhelper/compare/bedrockhelper-v1.0.1...bedrockhelper-v1.1.0) (2026-02-05)
+
+
+### Features
+
+* trigger release for PyPI publishing ([#13](https://github.com/losboss/bedrockhelper/issues/13)) ([d95c319](https://github.com/losboss/bedrockhelper/commit/d95c319734185dbd7a0911b3b399073dbd02ce90))
+
 ## [1.0.1](https://github.com/losboss/bedrockhelper/compare/bedrockhelper-v1.0.0...bedrockhelper-v1.0.1) (2026-02-05)
 
 
