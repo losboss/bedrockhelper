@@ -2,6 +2,9 @@ name: type-check
 
 on: [ push, pull_request ]
 
+permissions:
+  contents: read
+
 jobs:
   mypy:
     runs-on: ubuntu-latest
