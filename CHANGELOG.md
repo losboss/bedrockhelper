@@ -15,7 +15,7 @@
 
 ### Bug Fixes
 
-* add perms to github codeql workflow ([cd9ea7d](https://github.com/losboss/bedrockhelper/commit/cd9ea7d965233c48f2fd1e99551109b9710763a7))
+* add perms to GitHub CodeQL workflow ([cd9ea7d](https://github.com/losboss/bedrockhelper/commit/cd9ea7d965233c48f2fd1e99551109b9710763a7))
 * fixed mypy errors, added additional precommit hooks for linting, formatting, etc ([df0fe88](https://github.com/losboss/bedrockhelper/commit/df0fe881809e7ffd10a991e75936b512dc20de7b))
 
 
