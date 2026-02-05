@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.1](https://github.com/losboss/bedrockhelper/compare/bedrockhelper-v1.0.0...bedrockhelper-v1.0.1) (2026-02-05)
+
+
+### Bug Fixes
+
+* use dedicated PAT for release-please ([#10](https://github.com/losboss/bedrockhelper/issues/10)) ([144efa5](https://github.com/losboss/bedrockhelper/commit/144efa5bd56de78266a95254fe2ce47e584e2af4))
+
 ## [1.0.0](https://github.com/losboss/bedrockhelper/compare/bedrockhelper-v0.1.0...bedrockhelper-v1.0.0) (2026-02-05)
 
 

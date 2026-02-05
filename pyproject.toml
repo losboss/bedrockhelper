@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "bedrockhelper"
-version = "1.0.0"
+version = "1.0.1"
 description = "Helper utilities for Amazon Bedrock (RAG, embeddings, batch jobs)"
 authors = ["Matthew Marion <matthew@endofline.ca>"]
 readme = "README.md"
