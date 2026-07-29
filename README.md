@@ -55,7 +55,7 @@ from bedrockhelper import BedrockHelper
 
 helper = BedrockHelper(
 	region_name="ca-central-1",
-	rag_model_id="global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+	rag_model_id="global.anthropic.claude-sonnet-5",
 	embedding_model_id="amazon.titan-embed-text-v2:0",
 )
 ```
@@ -89,6 +89,40 @@ resp = helper.generate_with_rag(
 for chunk in resp.stream:
     print(chunk, end="")
 ```
+
+### Sampling parameters
+
+`temperature` has three meaningful states:
+
+| You pass | Behaviour |
+|---|---|
+| nothing | `0.1` is applied on models that accept it — low-variance output suited to RAG |
+| a `float` | your value is used |
+| `None` | nothing is sent; the model applies its own default (`1.0` for Claude) |
+
+```python
+resp = helper.generate_with_rag(
+    system_prompt="You are a helpful assistant.",
+    context="Some context",
+    question="Summarize this",
+    temperature=0.3,
+)
+```
+
+Newer Anthropic models reject sampling parameters entirely: `temperature`,
+`topP`, and `topK` were removed on Claude Opus 4.7, Opus 4.8, Opus 5, Fable 5,
+and Mythos 5, and Claude Sonnet 5 rejects any non-default value. Bedrock returns
+``ValidationException: `temperature` is deprecated for this model``.
+
+On those models — including the default, `global.anthropic.claude-sonnet-5` —
+the parameter is omitted for you and the request succeeds. A `temperature` you
+passed explicitly is dropped with a warning; the library's own default is
+dropped silently, since you never asked for it.
+
+If a model rejects sampling parameters anyway — a family newer than this
+release, or Sonnet 4.5 / Haiku 4.5, which accept `temperature` alone but reject
+it alongside `topP` — the request is retried once without them and a warning is
+logged. New models therefore work without waiting on a BedrockHelper release.
 
 ---
 

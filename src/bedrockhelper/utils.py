@@ -1,13 +1,57 @@
 import ast
 import json
+import logging
 import threading
 from queue import Queue
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple, Union
 
 from bedrockhelper.types import RecordInput
 
+log = logging.getLogger(__name__)
+
 DEFAULT_STOP_TYPES_INVOKE: Tuple[str, ...] = ('message_stop', 'completion_stop', 'end')
 DEFAULT_STOP_KEYS_CONVERSE: Tuple[str, ...] = ('messageStop', 'message_stop', 'stop', 'end')
+
+# Model families that reject sampling parameters (temperature / topP / topK).
+# Anthropic removed them on Opus 4.7+, Fable 5 and Mythos 5; Sonnet 5 rejects
+# any non-default value. Matched as substrings so bare, cross-region ("us.")
+# and global ("global.") Bedrock model IDs all resolve correctly.
+#
+# Sonnet 4.5 and Haiku 4.5 are deliberately absent: they accept temperature on
+# its own and only reject it alongside topP, which the retry path handles.
+MODELS_WITHOUT_SAMPLING_PARAMS: Tuple[str, ...] = (
+	'claude-opus-4-7',
+	'claude-opus-4-8',
+	'claude-opus-5',
+	'claude-sonnet-5',
+	'claude-fable-5',
+	'claude-mythos-5',
+)
+
+# Keys removed from a request when a model rejects sampling parameters.
+SAMPLING_PARAM_KEYS: Tuple[str, ...] = ('temperature', 'topP', 'top_p', 'topK', 'top_k')
+
+# Applied when the caller does not specify a temperature, on models that accept
+# one. Kept deliberately low: this library is aimed at RAG, where grounded,
+# low-variance answers matter more than creative range. Models that reject
+# sampling parameters never see it.
+DEFAULT_TEMPERATURE: float = 0.1
+
+
+class _Unset:
+	"""Sentinel type distinguishing "caller said nothing" from an explicit value."""
+
+	def __repr__(self) -> str:  # pragma: no cover - debugging aid
+		return '<unset>'
+
+
+# Default for temperature arguments. Three states are meaningful:
+#   UNSET  -> apply DEFAULT_TEMPERATURE where the model accepts it
+#   float  -> the caller's explicit choice
+#   None   -> send nothing; let the model apply its own default
+UNSET = _Unset()
+
+TemperatureArg = Union[float, None, _Unset]
 
 _SENTINEL = object()
 
@@ -182,18 +226,107 @@ def extract_converse_text(resp: dict[str, Any]) -> str:
 		return ''
 
 
+def supports_sampling_params(model_id: str) -> bool:
+	"""
+	Whether a model accepts sampling parameters (temperature / topP / topK).
+
+	Newer Anthropic models reject them outright, so sending one returns a
+	ValidationException. See MODELS_WITHOUT_SAMPLING_PARAMS.
+	"""
+	lowered = (model_id or '').lower()
+	return not any(family in lowered for family in MODELS_WITHOUT_SAMPLING_PARAMS)
+
+
+def strip_sampling_params(request: Mapping[str, Any]) -> Tuple[Dict[str, Any], bool]:
+	"""
+	Return a copy of a request with sampling parameters removed, along with
+	whether anything was actually removed.
+
+	Handles both request shapes: the nested inferenceConfig of converse(), and
+	the top-level keys of an invoke_model() Claude message body.
+
+	The input is not mutated.
+	"""
+	req = {k: v for k, v in request.items() if k not in SAMPLING_PARAM_KEYS}
+	removed = len(req) != len(request)
+
+	for section in ('inferenceConfig', 'additionalModelRequestFields'):
+		values = req.get(section)
+		if not isinstance(values, Mapping):
+			continue
+		kept = {k: v for k, v in values.items() if k not in SAMPLING_PARAM_KEYS}
+		if len(kept) != len(values):
+			req[section] = kept
+			removed = True
+
+	return req, removed
+
+
+def is_sampling_param_error(exc: BaseException) -> bool:
+	"""
+	Whether an exception is Bedrock rejecting a sampling parameter.
+
+	Matches the ValidationException raised when a model no longer accepts
+	temperature / topP / topK, or refuses more than one of them at once.
+	"""
+	response = getattr(exc, 'response', None)
+	if isinstance(response, Mapping):
+		error = response.get('Error')
+		code = error.get('Code') if isinstance(error, Mapping) else None
+		if code and 'validationexception' not in str(code).lower():
+			return False
+
+	message = str(exc).lower()
+	if 'validationexception' not in message and not isinstance(response, Mapping):
+		return False
+
+	return any(key.lower() in message for key in SAMPLING_PARAM_KEYS)
+
+
+def resolve_temperature(model_id: str, temperature: TemperatureArg = UNSET) -> Optional[float]:
+	"""
+	Decide the temperature to send for a model, or None to omit it entirely.
+
+	Dropping a value the caller chose is worth a warning; dropping this
+	library's own default is not, or every call to a model like Sonnet 5 would
+	warn about a value the caller never asked for.
+	"""
+	if isinstance(temperature, _Unset):
+		value: Optional[float] = DEFAULT_TEMPERATURE
+		explicit = False
+	else:
+		value = temperature
+		explicit = True
+
+	if value is None or supports_sampling_params(model_id):
+		return value
+
+	if explicit:
+		log.warning(
+			'Model %s does not accept sampling parameters; ignoring temperature=%s.',
+			model_id,
+			value,
+		)
+	else:
+		log.debug('Model %s does not accept sampling parameters; omitting the default temperature.', model_id)
+	return None
+
+
 def build_converse_request(
 	model_id: str,
 	system_prompt: str,
 	context: str,
 	question: str,
 	max_tokens: int,
-	temperature: float,
+	temperature: TemperatureArg = UNSET,
 	rag_instructions: str = '',
 	**extra_params: Any,
 ) -> Dict[str, Any]:
 	"""
 	Build the shared request payload for converse() and converse_stream().
+
+	temperature is omitted entirely on models that reject sampling parameters,
+	and when the caller passes None.
 	"""
 
 	user_text = f'Context:\n{context}\n'
@@ -201,6 +334,11 @@ def build_converse_request(
 		user_text += f'\nQuestion:\n{question}\n'
 	if rag_instructions:
 		user_text = f'{rag_instructions}\n{user_text}'
+
+	inference_config: Dict[str, Any] = {'maxTokens': max_tokens}
+	resolved = resolve_temperature(model_id, temperature)
+	if resolved is not None:
+		inference_config['temperature'] = resolved
 
 	req: Dict[str, Any] = {
 		'modelId': model_id,
@@ -211,10 +349,7 @@ def build_converse_request(
 				'content': [{'text': user_text}],
 			}
 		],
-		'inferenceConfig': {
-			'maxTokens': max_tokens,
-			'temperature': temperature,
-		},
+		'inferenceConfig': inference_config,
 		# Enable usage metrics in streaming responses
 		'performanceConfig': {
 			'latency': 'standard'  # or 'optimized'
