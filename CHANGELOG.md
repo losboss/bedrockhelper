@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.2.0](https://github.com/losboss/bedrockhelper/compare/bedrockhelper-v1.1.0...bedrockhelper-v1.2.0) (2026-07-29)
+
+
+### Features
+
+* handle temperature deprecation on newer Anthropic models ([#30](https://github.com/losboss/bedrockhelper/issues/30)) ([bdaa71d](https://github.com/losboss/bedrockhelper/commit/bdaa71d7f5fdd66fc2b0de9c6e7f12ada7831201))
+
+
+### Dependencies
+
+* bump pytest from 9.0.2 to 9.0.3 ([#26](https://github.com/losboss/bedrockhelper/issues/26)) ([9be47f9](https://github.com/losboss/bedrockhelper/commit/9be47f9ccef4a6b68a0bc2e0affd90eb51d6df7f))
+* bump the python-dependencies group across 1 directory with 9 updates ([#27](https://github.com/losboss/bedrockhelper/issues/27)) ([6cb1607](https://github.com/losboss/bedrockhelper/commit/6cb1607b73597ef4988f78573d9a1358c1890c5c))
+* bump urllib3 from 2.6.3 to 2.7.0 ([#29](https://github.com/losboss/bedrockhelper/issues/29)) ([8e93c73](https://github.com/losboss/bedrockhelper/commit/8e93c737037b3e193265d4158adcaf392701d6f1))
+
 ## [1.1.0](https://github.com/losboss/bedrockhelper/compare/bedrockhelper-v1.0.2...bedrockhelper-v1.1.0) (2026-02-05)
 
 
