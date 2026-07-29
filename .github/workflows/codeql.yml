@@ -7,6 +7,10 @@ on:
     branches: [main]
   schedule:
     - cron: '0 6 * * 1'  # Weekly on Monday at 6am UTC
+  # GitHub disables scheduled workflows after ~60 days of repo inactivity. That
+  # also stops them running on pull_request, and the ruleset requires CodeQL
+  # results to merge - so the block has no self-service fix without this.
+  workflow_dispatch:
 
 jobs:
   analyze:
