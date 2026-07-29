@@ -333,7 +333,7 @@ class BedrockHelper:
 	def _call_with_refresh(self, fn: Callable[..., _T], *args: Any, **kwargs: Any) -> _T:
 		try:
 			return fn(*args, **kwargs)
-		except BaseException as e:
+		except Exception as e:
 			if not _is_expired_token(e):
 				raise
 			# Invalidate session+clients and retry once.
@@ -351,7 +351,7 @@ class BedrockHelper:
 		"""
 		try:
 			return self._call_with_refresh(fn, **request)
-		except BaseException as e:
+		except Exception as e:
 			if not is_sampling_param_error(e):
 				raise
 			retry_request, removed = strip_sampling_params(request)
@@ -378,7 +378,7 @@ class BedrockHelper:
 		"""
 		try:
 			return self._call_with_refresh(fn, modelId=model_id, body=json.dumps(body), **kwargs)
-		except BaseException as e:
+		except Exception as e:
 			if not is_sampling_param_error(e):
 				raise
 			retry_body, removed = strip_sampling_params(body)
@@ -869,6 +869,9 @@ class BedrockHelper:
 
 				push_done()
 
+			# Deliberately BaseException: push_error is what unblocks the async
+			# consumer. Anything escaping here - including CancelledError, which
+			# is not an Exception - leaves it waiting on the queue forever.
 			except BaseException as e:
 				push_error(e)
 			finally:
