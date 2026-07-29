@@ -1,17 +1,23 @@
 import json
 from unittest import TestCase
 
+from botocore.exceptions import ClientError
+
 from bedrockhelper.utils import (
+	DEFAULT_TEMPERATURE,
 	_decode_bedrock_chunk_bytes,
 	_iter_stream_with_callback,
 	build_converse_request,
 	extract_converse_text,
 	format_context_passages,
+	is_sampling_param_error,
 	iter_bedrock_stream_text,
 	iter_bedrock_stream_text_gen_with_tail,
 	normalize_headers,
 	normalize_records,
 	normalize_s3_bucket_name,
+	strip_sampling_params,
+	supports_sampling_params,
 	truncate_by_chars,
 )
 
@@ -364,6 +370,165 @@ class TestBuildConverseRequest(TestCase):
 			customField='value',
 		)
 		self.assertEqual(req['customField'], 'value')
+
+	def test_library_default_applied_when_not_provided(self):
+		req = build_converse_request(
+			model_id='anthropic.claude-sonnet-4-5-20250929-v1:0',
+			system_prompt='sys',
+			context='ctx',
+			question='q',
+			max_tokens=50,
+		)
+		self.assertEqual(req['inferenceConfig']['temperature'], DEFAULT_TEMPERATURE)
+		self.assertEqual(req['inferenceConfig']['maxTokens'], 50)
+
+	def test_explicit_none_omits_temperature(self):
+		req = build_converse_request(
+			model_id='anthropic.claude-sonnet-4-5-20250929-v1:0',
+			system_prompt='sys',
+			context='ctx',
+			question='q',
+			max_tokens=50,
+			temperature=None,
+		)
+		self.assertNotIn('temperature', req['inferenceConfig'])
+
+	def test_temperature_dropped_for_incompatible_model(self):
+		with self.assertLogs('bedrockhelper.utils', level='WARNING') as logs:
+			req = build_converse_request(
+				model_id='global.anthropic.claude-sonnet-5',
+				system_prompt='sys',
+				context='ctx',
+				question='q',
+				max_tokens=50,
+				temperature=0.1,
+			)
+		self.assertNotIn('temperature', req['inferenceConfig'])
+		self.assertIn('claude-sonnet-5', logs.output[0])
+
+	def test_library_default_dropped_quietly_for_incompatible_model(self):
+		# The caller never chose 0.1, so dropping it must not warn - otherwise
+		# every default-path call to Sonnet 5 logs a spurious warning.
+		with self.assertLogs('bedrockhelper.utils', level='DEBUG') as logs:
+			req = build_converse_request(
+				model_id='global.anthropic.claude-sonnet-5',
+				system_prompt='sys',
+				context='ctx',
+				question='q',
+				max_tokens=50,
+			)
+		self.assertNotIn('temperature', req['inferenceConfig'])
+		self.assertEqual([r.levelname for r in logs.records], ['DEBUG'])
+
+	def test_temperature_kept_for_compatible_model(self):
+		req = build_converse_request(
+			model_id='anthropic.claude-sonnet-4-5-20250929-v1:0',
+			system_prompt='sys',
+			context='ctx',
+			question='q',
+			max_tokens=50,
+			temperature=0.3,
+		)
+		self.assertEqual(req['inferenceConfig']['temperature'], 0.3)
+
+
+class TestSupportsSamplingParams(TestCase):
+	def test_incompatible_families(self):
+		for model_id in (
+			'anthropic.claude-opus-4-7-20260210-v1:0',
+			'us.anthropic.claude-opus-4-8-20260401-v1:0',
+			'anthropic.claude-opus-5-20260601-v1:0',
+			'global.anthropic.claude-sonnet-5-20260115-v1:0',
+			'anthropic.claude-fable-5-20260601-v1:0',
+			'anthropic.claude-mythos-5-20260601-v1:0',
+		):
+			with self.subTest(model_id=model_id):
+				self.assertFalse(supports_sampling_params(model_id))
+
+	def test_compatible_models(self):
+		for model_id in (
+			'anthropic.claude-sonnet-4-5-20250929-v1:0',
+			'global.anthropic.claude-haiku-4-5-20251001-v1:0',
+			'anthropic.claude-opus-4-6-20260101-v1:0',
+			'amazon.titan-embed-text-v2:0',
+			'amazon.nova-pro-v1:0',
+			'test-model',
+		):
+			with self.subTest(model_id=model_id):
+				self.assertTrue(supports_sampling_params(model_id))
+
+	def test_case_insensitive(self):
+		self.assertFalse(supports_sampling_params('ANTHROPIC.CLAUDE-SONNET-5-V1:0'))
+
+	def test_empty_model_id(self):
+		self.assertTrue(supports_sampling_params(''))
+
+
+class TestStripSamplingParams(TestCase):
+	def test_strips_from_inference_config(self):
+		req = {
+			'modelId': 'm',
+			'inferenceConfig': {'maxTokens': 10, 'temperature': 0.5, 'topP': 0.9},
+		}
+		stripped, removed = strip_sampling_params(req)
+		self.assertTrue(removed)
+		self.assertEqual(stripped['inferenceConfig'], {'maxTokens': 10})
+
+	def test_strips_top_level_keys(self):
+		body = {'max_tokens': 10, 'temperature': 0.5, 'top_p': 0.9, 'system': 'sys'}
+		stripped, removed = strip_sampling_params(body)
+		self.assertTrue(removed)
+		self.assertEqual(stripped, {'max_tokens': 10, 'system': 'sys'})
+
+	def test_strips_from_additional_model_request_fields(self):
+		req = {'additionalModelRequestFields': {'top_k': 5, 'other': 1}}
+		stripped, removed = strip_sampling_params(req)
+		self.assertTrue(removed)
+		self.assertEqual(stripped['additionalModelRequestFields'], {'other': 1})
+
+	def test_reports_no_change(self):
+		req = {'modelId': 'm', 'inferenceConfig': {'maxTokens': 10}}
+		stripped, removed = strip_sampling_params(req)
+		self.assertFalse(removed)
+		self.assertEqual(stripped, req)
+
+	def test_does_not_mutate_input(self):
+		req = {'inferenceConfig': {'maxTokens': 10, 'temperature': 0.5}}
+		strip_sampling_params(req)
+		self.assertEqual(req['inferenceConfig']['temperature'], 0.5)
+
+
+class TestIsSamplingParamError(TestCase):
+	@staticmethod
+	def _validation_error(message: str) -> ClientError:
+		return ClientError({'Error': {'Code': 'ValidationException', 'Message': message}}, 'Converse')
+
+	def test_temperature_rejected(self):
+		err = self._validation_error('This model does not support temperature.')
+		self.assertTrue(is_sampling_param_error(err))
+
+	def test_matches_live_bedrock_wording(self):
+		# Verbatim message returned by Converse for claude-sonnet-5 on
+		# 2026-07-29. Note the backticks around the parameter name.
+		err = self._validation_error(
+			'The model returned the following errors: `temperature` is deprecated for this model.'
+		)
+		self.assertTrue(is_sampling_param_error(err))
+
+	def test_temperature_and_top_p_conflict(self):
+		err = self._validation_error('temperature and top_p cannot both be specified for this model.')
+		self.assertTrue(is_sampling_param_error(err))
+
+	def test_unrelated_validation_error(self):
+		err = self._validation_error('The provided model identifier is invalid.')
+		self.assertFalse(is_sampling_param_error(err))
+
+	def test_non_validation_client_error(self):
+		err = ClientError({'Error': {'Code': 'ThrottlingException', 'Message': 'temperature'}}, 'Converse')
+		self.assertFalse(is_sampling_param_error(err))
+
+	def test_plain_exception(self):
+		self.assertFalse(is_sampling_param_error(Exception('temperature is bad')))
 
 
 class TestNormalizeS3BucketName(TestCase):

@@ -9,29 +9,26 @@ packages = [{ include = "bedrockhelper", from = "src" }]
 include = ["README.md", "LICENSE*"]
 
 [tool.poetry.dependencies]
-python = ">=3.10,<4.0"
+python = ">=3.11,<4.0"
 boto3 = "^1.42.25"
 botocore = { extras = ["crt"], version = "^1.42.42" }
-boto3-stubs = "~=1.42.42"
-ipykernel = "^7.1.0"
+boto3-stubs = "^1.42.42"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^9.0.2"
 pytest-cov = "^7.0.0"
-mypy = "^1.14.0"
-ruff = "^0.15.0"
+mypy = "^2.3.0"
+ruff = "^0.16.0"
 pre-commit = "^4.0.0"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
-[tool.ruff]
-line-length = 100
-target-version = "py310"
-exclude = [".venv", "dist", "build"]
+# Ruff is configured in ruff.toml, which takes precedence over pyproject.toml.
+# Do not add [tool.ruff] here - it would be silently ignored.
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.11"
 mypy_path = ["src"]
 packages = ["bedrockhelper"]
 strict = true

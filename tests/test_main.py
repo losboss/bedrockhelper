@@ -227,7 +227,7 @@ class TestBedrockHelperInit(TestCase):
 				bedrock_client=Mock(),
 				s3_client=Mock(),
 			)
-			self.assertEqual(helper.rag_model_id, 'global.anthropic.claude-sonnet-4-5-20250929-v1:0')
+			self.assertEqual(helper.rag_model_id, 'global.anthropic.claude-sonnet-5')
 
 	def test_env_var_model_ids(self):
 		with patch.dict(
@@ -470,6 +470,175 @@ class TestGenerateWithRAG(TestCase):
 		self.assertEqual(result.text, 'invoke answer')
 		self.mock_runtime.converse.assert_not_called()
 
+	def test_no_temperature_sent_by_default(self):
+		# Default model is Sonnet 5, which has no temperature knob at all.
+		self.mock_runtime.converse.return_value = {
+			'output': {'message': {'content': [{'text': 'answer'}]}},
+			'ResponseMetadata': {'HTTPHeaders': {}},
+		}
+
+		self.helper.generate_with_rag(system_prompt='prompt', context='context')
+
+		inference_config = self.mock_runtime.converse.call_args[1]['inferenceConfig']
+		self.assertNotIn('temperature', inference_config)
+
+	def test_older_model_keeps_library_default_temperature(self):
+		# Backward-compatibility guard: a caller on a model that still accepts
+		# temperature, passing none, must keep getting 0.1 rather than silently
+		# falling through to the model's own default of 1.0.
+		self.mock_runtime.converse.return_value = {
+			'output': {'message': {'content': [{'text': 'answer'}]}},
+			'ResponseMetadata': {'HTTPHeaders': {}},
+		}
+
+		self.helper.generate_with_rag(
+			system_prompt='prompt',
+			context='context',
+			model_id='global.anthropic.claude-haiku-4-5-20251001-v1:0',
+		)
+
+		inference_config = self.mock_runtime.converse.call_args[1]['inferenceConfig']
+		self.assertEqual(inference_config['temperature'], 0.1)
+
+	def test_explicit_none_defers_to_model_default(self):
+		self.mock_runtime.converse.return_value = {
+			'output': {'message': {'content': [{'text': 'answer'}]}},
+			'ResponseMetadata': {'HTTPHeaders': {}},
+		}
+
+		self.helper.generate_with_rag(
+			system_prompt='prompt',
+			context='context',
+			model_id='anthropic.claude-sonnet-4-5-20250929-v1:0',
+			temperature=None,
+		)
+
+		inference_config = self.mock_runtime.converse.call_args[1]['inferenceConfig']
+		self.assertNotIn('temperature', inference_config)
+
+	def test_temperature_omitted_for_incompatible_model(self):
+		self.mock_runtime.converse.return_value = {
+			'output': {'message': {'content': [{'text': 'answer'}]}},
+			'ResponseMetadata': {'HTTPHeaders': {}},
+		}
+
+		self.helper.generate_with_rag(
+			system_prompt='prompt',
+			context='context',
+			model_id='global.anthropic.claude-sonnet-5-20260115-v1:0',
+			temperature=0.5,
+		)
+
+		inference_config = self.mock_runtime.converse.call_args[1]['inferenceConfig']
+		self.assertNotIn('temperature', inference_config)
+
+	def test_retries_without_sampling_params_on_validation_error(self):
+		self.mock_runtime.converse.side_effect = [
+			ClientError(
+				{'Error': {'Code': 'ValidationException', 'Message': 'temperature is not supported'}},
+				'Converse',
+			),
+			{
+				'output': {'message': {'content': [{'text': 'answer'}]}},
+				'ResponseMetadata': {'HTTPHeaders': {}},
+			},
+		]
+
+		result = self.helper.generate_with_rag(
+			system_prompt='prompt',
+			context='context',
+			model_id='anthropic.claude-sonnet-4-5-20250929-v1:0',
+			temperature=0.5,
+		)
+
+		self.assertEqual(result.text, 'answer')
+		self.assertEqual(self.mock_runtime.converse.call_count, 2)
+		self.assertEqual(self.mock_runtime.converse.call_args_list[0][1]['inferenceConfig']['temperature'], 0.5)
+		self.assertNotIn('temperature', self.mock_runtime.converse.call_args_list[1][1]['inferenceConfig'])
+		self.mock_runtime.invoke_model.assert_not_called()
+
+	def test_retry_exhausted_falls_back_to_invoke_model(self):
+		error = ClientError(
+			{'Error': {'Code': 'ValidationException', 'Message': 'temperature is not supported'}},
+			'Converse',
+		)
+		self.mock_runtime.converse.side_effect = error
+		self.mock_runtime.invoke_model.return_value = {
+			'body': Mock(read=lambda: json.dumps({'content': [{'text': 'fallback answer'}]}).encode()),
+			'ResponseMetadata': {'HTTPHeaders': {}},
+		}
+
+		result = self.helper.generate_with_rag(
+			system_prompt='prompt',
+			context='context',
+			model_id='anthropic.claude-sonnet-4-5-20250929-v1:0',
+			temperature=0.5,
+		)
+
+		self.assertEqual(result.text, 'fallback answer')
+		self.assertEqual(self.mock_runtime.converse.call_count, 2)
+
+	def test_invoke_model_omits_temperature_for_incompatible_model(self):
+		self.mock_runtime.invoke_model.return_value = {
+			'body': Mock(read=lambda: json.dumps({'content': [{'text': 'answer'}]}).encode()),
+			'ResponseMetadata': {'HTTPHeaders': {}},
+		}
+
+		self.helper.generate_with_rag(
+			system_prompt='prompt',
+			context='context',
+			model_id='anthropic.claude-opus-5-20260601-v1:0',
+			temperature=0.5,
+			prefer_converse=False,
+		)
+
+		body = json.loads(self.mock_runtime.invoke_model.call_args[1]['body'])
+		self.assertNotIn('temperature', body)
+
+	def test_invoke_model_retries_without_sampling_params(self):
+		self.mock_runtime.invoke_model.side_effect = [
+			ClientError(
+				{'Error': {'Code': 'ValidationException', 'Message': 'temperature and top_p cannot both be specified'}},
+				'InvokeModel',
+			),
+			{
+				'body': Mock(read=lambda: json.dumps({'content': [{'text': 'answer'}]}).encode()),
+				'ResponseMetadata': {'HTTPHeaders': {}},
+			},
+		]
+
+		result = self.helper.generate_with_rag(
+			system_prompt='prompt',
+			context='context',
+			model_id='anthropic.claude-sonnet-4-5-20250929-v1:0',
+			temperature=0.5,
+			prefer_converse=False,
+		)
+
+		self.assertEqual(result.text, 'answer')
+		self.assertEqual(self.mock_runtime.invoke_model.call_count, 2)
+		retry_body = json.loads(self.mock_runtime.invoke_model.call_args_list[1][1]['body'])
+		self.assertNotIn('temperature', retry_body)
+
+	def test_unrelated_validation_error_is_not_retried(self):
+		self.mock_runtime.converse.side_effect = ClientError(
+			{'Error': {'Code': 'ValidationException', 'Message': 'invalid model identifier'}},
+			'Converse',
+		)
+		self.mock_runtime.invoke_model.return_value = {
+			'body': Mock(read=lambda: json.dumps({'content': [{'text': 'fallback answer'}]}).encode()),
+			'ResponseMetadata': {'HTTPHeaders': {}},
+		}
+
+		self.helper.generate_with_rag(
+			system_prompt='prompt',
+			context='context',
+			model_id='anthropic.claude-sonnet-4-5-20250929-v1:0',
+			temperature=0.5,
+		)
+
+		self.assertEqual(self.mock_runtime.converse.call_count, 1)
+
 
 class TestExtractTextFromClaude(TestCase):
 	def test_content_list(self):
@@ -565,6 +734,53 @@ class TestStreamWithRAG(TestCase):
 		texts = list(stream)
 		self.assertEqual(texts, ['invoke'])
 		self.mock_runtime.converse_stream.assert_not_called()
+
+	def test_converse_stream_retries_without_sampling_params(self):
+		mock_stream = [
+			{'contentBlockDelta': {'delta': {'text': 'hello'}}},
+			{'messageStop': {'stopReason': 'done'}},
+		]
+		self.mock_runtime.converse_stream.side_effect = [
+			ClientError(
+				{'Error': {'Code': 'ValidationException', 'Message': 'temperature is not supported'}},
+				'ConverseStream',
+			),
+			{
+				'stream': iter(mock_stream),
+				'ResponseMetadata': {'HTTPHeaders': {}},
+			},
+		]
+
+		stream = self.helper.stream_with_rag(
+			system_prompt='prompt',
+			context='context',
+			model_id='anthropic.claude-sonnet-4-5-20250929-v1:0',
+			temperature=0.5,
+		)
+
+		self.assertEqual(list(stream), ['hello'])
+		self.assertEqual(self.mock_runtime.converse_stream.call_count, 2)
+		self.assertNotIn(
+			'temperature',
+			self.mock_runtime.converse_stream.call_args_list[1][1]['inferenceConfig'],
+		)
+		self.mock_runtime.invoke_model_with_response_stream.assert_not_called()
+
+	def test_converse_stream_omits_temperature_for_incompatible_model(self):
+		self.mock_runtime.converse_stream.return_value = {
+			'stream': iter([{'messageStop': {'stopReason': 'done'}}]),
+			'ResponseMetadata': {'HTTPHeaders': {}},
+		}
+
+		self.helper.stream_with_rag(
+			system_prompt='prompt',
+			context='context',
+			model_id='anthropic.claude-opus-5-20260601-v1:0',
+			temperature=0.5,
+		)
+
+		inference_config = self.mock_runtime.converse_stream.call_args[1]['inferenceConfig']
+		self.assertNotIn('temperature', inference_config)
 
 
 class TestEmbedTexts(TestCase):

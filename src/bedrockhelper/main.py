@@ -52,13 +52,18 @@ from botocore.session import Session as BotocoreSession
 
 from bedrockhelper.models import BatchJobResponse, EmbeddingResponse, InvocationMetrics, RAGResponse, RAGStream
 from bedrockhelper.utils import (
+	UNSET,
+	TemperatureArg,
 	build_converse_request,
 	extract_converse_text,
 	format_context_passages,
+	is_sampling_param_error,
 	iter_bedrock_stream_text_gen_with_tail,
 	normalize_headers,
 	normalize_records,
 	normalize_s3_bucket_name,
+	resolve_temperature,
+	strip_sampling_params,
 	truncate_by_chars,
 )
 
@@ -278,9 +283,7 @@ class BedrockHelper:
 		# streaming
 		max_concurrent_streams: int = 8,
 	) -> None:
-		self.rag_model_id = (
-			rag_model_id or os.environ.get('AWS_MODEL_ID') or 'global.anthropic.claude-sonnet-4-5-20250929-v1:0'
-		)
+		self.rag_model_id = rag_model_id or os.environ.get('AWS_MODEL_ID') or 'global.anthropic.claude-sonnet-5'
 		self.embedding_model_id = (
 			embedding_model_id or os.environ.get('AWS_EMBEDDING_MODEL_ID') or 'amazon.titan-embed-text-v2:0'
 		)
@@ -330,13 +333,63 @@ class BedrockHelper:
 	def _call_with_refresh(self, fn: Callable[..., _T], *args: Any, **kwargs: Any) -> _T:
 		try:
 			return fn(*args, **kwargs)
-		except BaseException as e:
+		except Exception as e:
 			if not _is_expired_token(e):
 				raise
 			# Invalidate session+clients and retry once.
 			self._session_mgr.invalidate()
 			self._refresh_clients_if_needed()
 			return fn(*args, **kwargs)
+
+	def _call_converse_with_sampling_fallback(self, fn: Callable[..., _T], request: Dict[str, Any]) -> _T:
+		"""
+		Invoke converse()/converse_stream(), retrying once without sampling
+		parameters if the model rejects them.
+
+		Covers models released after this version, and models that accept
+		temperature alone but reject it alongside topP.
+		"""
+		try:
+			return self._call_with_refresh(fn, **request)
+		except Exception as e:
+			if not is_sampling_param_error(e):
+				raise
+			retry_request, removed = strip_sampling_params(request)
+			if not removed:
+				raise
+			log.warning(
+				'Model %s rejected sampling parameters; retrying without them: %s',
+				request.get('modelId'),
+				e,
+			)
+			return self._call_with_refresh(fn, **retry_request)
+
+	def _call_invoke_with_sampling_fallback(
+		self,
+		fn: Callable[..., _T],
+		*,
+		model_id: str,
+		body: Dict[str, Any],
+		**kwargs: Any,
+	) -> _T:
+		"""
+		Invoke invoke_model()/invoke_model_with_response_stream(), retrying once
+		without sampling parameters if the model rejects them.
+		"""
+		try:
+			return self._call_with_refresh(fn, modelId=model_id, body=json.dumps(body), **kwargs)
+		except Exception as e:
+			if not is_sampling_param_error(e):
+				raise
+			retry_body, removed = strip_sampling_params(body)
+			if not removed:
+				raise
+			log.warning(
+				'Model %s rejected sampling parameters; retrying without them: %s',
+				model_id,
+				e,
+			)
+			return self._call_with_refresh(fn, modelId=model_id, body=json.dumps(retry_body), **kwargs)
 
 	# ------------------------------------------------------------------
 	# Metrics helpers
@@ -464,7 +517,7 @@ class BedrockHelper:
 		include_headers_in_context: bool = False,
 		question: Optional[str] = '',
 		model_id: Optional[str] = None,
-		temperature: float = 0.1,
+		temperature: TemperatureArg = UNSET,
 		max_tokens: int = 8192,
 		max_context_chars: Optional[int] = 150_000,
 		prefer_converse: bool = True,
@@ -492,8 +545,8 @@ class BedrockHelper:
 					rag_instructions=rag_instructions,
 					**extra_params,
 				)
-			except Exception:
-				log.debug('Converse path failed; falling back to invoke_model.', exc_info=True)
+			except Exception as e:
+				log.warning('Converse path failed (%s); falling back to invoke_model.', e, exc_info=True)
 
 		# 2) Fallback: Claude message format
 		return self._generate_with_claude_message_format(
@@ -515,7 +568,7 @@ class BedrockHelper:
 		context: str,
 		question: str,
 		max_tokens: int,
-		temperature: float,
+		temperature: TemperatureArg,
 		rag_instructions: str,
 		**extra_params: Any,
 	) -> RAGResponse:
@@ -530,7 +583,7 @@ class BedrockHelper:
 			**extra_params,
 		)
 
-		resp = self._call_with_refresh(self.bedrock_runtime.converse, **req)
+		resp = self._call_converse_with_sampling_fallback(self.bedrock_runtime.converse, req)
 		text = extract_converse_text(resp if isinstance(resp, dict) else {})
 		metrics = self._extract_metrics_from_response(resp, resp if isinstance(resp, dict) else None)
 		return RAGResponse(text=text, stream=False, metrics=metrics, raw_response=resp)
@@ -542,7 +595,7 @@ class BedrockHelper:
 		system_prompt: str,
 		context: str,
 		question: str,
-		temperature: float,
+		temperature: TemperatureArg,
 		max_tokens: int,
 		rag_instructions: str = '',
 		**extra_params: Any,
@@ -556,15 +609,17 @@ class BedrockHelper:
 			'system': system_prompt,
 			'messages': [{'role': 'user', 'content': [{'type': 'text', 'text': user_text}]}],
 			'max_tokens': max_tokens,
-			'temperature': temperature,
 		}
+		resolved_temperature = resolve_temperature(model_id, temperature)
+		if resolved_temperature is not None:
+			request_body['temperature'] = resolved_temperature
 		if extra_params:
 			request_body.update(extra_params)
 
-		resp = self._call_with_refresh(
+		resp = self._call_invoke_with_sampling_fallback(
 			self.bedrock_runtime.invoke_model,
-			modelId=model_id,
-			body=json.dumps(request_body),
+			model_id=model_id,
+			body=request_body,
 		)
 		body_bytes = resp.get('body').read()
 		try:
@@ -609,7 +664,7 @@ class BedrockHelper:
 		include_headers_in_context: bool = False,
 		question: Optional[str] = '',
 		model_id: Optional[str] = None,
-		temperature: float = 0.1,
+		temperature: TemperatureArg = UNSET,
 		max_tokens: int = 8192,
 		max_context_chars: Optional[int] = 150_000,
 		prefer_converse: bool = True,
@@ -638,7 +693,7 @@ class BedrockHelper:
 					rag_instructions=rag_instructions,
 					**extra_params,
 				)
-				resp = self._call_with_refresh(self.bedrock_runtime.converse_stream, **req)
+				resp = self._call_converse_with_sampling_fallback(self.bedrock_runtime.converse_stream, req)
 				stream_obj = resp.get('stream')
 				if stream_obj is None:
 					raise RuntimeError("converse_stream response missing 'stream'")
@@ -680,8 +735,8 @@ class BedrockHelper:
 				stream_ref['stream'] = stream
 				return stream
 
-			except Exception:
-				log.debug('converse_stream failed; falling back.', exc_info=True)
+			except Exception as e:
+				log.warning('converse_stream failed (%s); falling back.', e, exc_info=True)
 
 		# 2) Fallback invoke_model_with_response_stream (Claude message format)
 		user_text = f'{rag_instructions}\nContext:\n{ctx}\n'
@@ -693,15 +748,17 @@ class BedrockHelper:
 			'system': system_prompt,
 			'messages': [{'role': 'user', 'content': [{'type': 'text', 'text': user_text}]}],
 			'max_tokens': max_tokens,
-			'temperature': temperature,
 		}
+		resolved_temperature = resolve_temperature(selected_model, temperature)
+		if resolved_temperature is not None:
+			body['temperature'] = resolved_temperature
 		if extra_params:
 			body.update(extra_params)
 
-		resp = self._call_with_refresh(
+		resp = self._call_invoke_with_sampling_fallback(
 			self.bedrock_runtime.invoke_model_with_response_stream,
-			modelId=selected_model,
-			body=json.dumps(body),
+			model_id=selected_model,
+			body=body,
 		)
 		event_stream = resp.get('body')
 		if event_stream is None:
@@ -812,6 +869,9 @@ class BedrockHelper:
 
 				push_done()
 
+			# Deliberately BaseException: push_error is what unblocks the async
+			# consumer. Anything escaping here - including CancelledError, which
+			# is not an Exception - leaves it waiting on the queue forever.
 			except BaseException as e:
 				push_error(e)
 			finally:
