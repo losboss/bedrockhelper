@@ -12,8 +12,10 @@ include = ["README.md", "LICENSE*"]
 python = ">=3.10,<4.0"
 boto3 = "^1.42.25"
 botocore = { extras = ["crt"], version = "^1.42.42" }
-boto3-stubs = "~=1.42.42"
-ipykernel = "^7.1.0"
+boto3-stubs = "^1.42.42"
+# Used by types.py for NotRequired, which is stdlib only from 3.11. Declared
+# explicitly: it previously arrived transitively via ipykernel.
+typing-extensions = "^4.12"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^9.0.2"
@@ -21,6 +23,9 @@ pytest-cov = "^7.0.0"
 mypy = "^1.14.0"
 ruff = "^0.15.0"
 pre-commit = "^4.0.0"
+# Local notebook exploration only. Never import this from src/ - it pulls the
+# whole Jupyter kernel stack (tornado, pyzmq, debugpy) into consumer installs.
+ipykernel = "^7.1.0"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
