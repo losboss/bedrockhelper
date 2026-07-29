@@ -1,6 +1,4 @@
-from typing import Dict, List, Mapping, Tuple, TypedDict, Union
-
-from typing_extensions import NotRequired
+from typing import Dict, List, Mapping, NotRequired, Tuple, TypedDict, Union
 
 
 RecordInput = Union[

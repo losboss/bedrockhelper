@@ -1,0 +1,75 @@
+name: ci
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: py${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12', '3.13']
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: "1.8.5"
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+
+      - name: Cache virtualenv
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-py${{ matrix.python-version }}-${{ hashFiles('poetry.lock') }}
+
+      - name: Install dependencies
+        run: poetry install --no-interaction
+
+      - name: Lint
+        run: poetry run ruff check .
+
+      - name: Format check
+        run: poetry run ruff format --check .
+
+      # Uses the strict config in pyproject.toml, not an ad-hoc override.
+      - name: Type check
+        run: poetry run mypy src
+
+      - name: Tests
+        run: poetry run pytest
+
+      - name: Build
+        run: poetry build
+
+      # A green test suite still misses undeclared runtime dependencies, since
+      # the dev environment already has them. Installing the built wheel into a
+      # bare venv is what catches those.
+      - name: Verify wheel installs standalone
+        run: |
+          python -m venv /tmp/wheelcheck
+          /tmp/wheelcheck/bin/pip install --quiet dist/*.whl
+          /tmp/wheelcheck/bin/python -c "
+          from bedrockhelper import BedrockHelper
+          from bedrockhelper.types import RecordInput
+          from bedrockhelper.utils import build_converse_request, supports_sampling_params
+          assert supports_sampling_params('global.anthropic.claude-sonnet-5') is False
+          req = build_converse_request(
+              model_id='global.anthropic.claude-sonnet-5',
+              system_prompt='s', context='c', question='q', max_tokens=8,
+          )
+          assert 'temperature' not in req['inferenceConfig'], req
+          print('wheel imports and behaves correctly')
+          "
