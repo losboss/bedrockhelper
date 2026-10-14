@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.1](https://github.com/losboss/bedrockhelper/compare/bedrockhelper-v1.2.0...bedrockhelper-v1.2.1) (2026-10-14)
+
+
+### Dependencies
+
+* bulk-upgrade dependencies and actions, fix Dependabot alerts ([#54](https://github.com/losboss/bedrockhelper/issues/54)) ([30988c8](https://github.com/losboss/bedrockhelper/commit/30988c8b461dc5ef479b6e6aa2a502a5fc20eab7))
+
 ## [1.2.0](https://github.com/losboss/bedrockhelper/compare/bedrockhelper-v1.1.0...bedrockhelper-v1.2.0) (2026-07-29)
 
 
