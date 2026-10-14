@@ -17,9 +17,9 @@ boto3-stubs = "^1.42.42"
 [tool.poetry.group.dev.dependencies]
 pytest = "^9.0.2"
 pytest-cov = "^7.0.0"
-mypy = "^2.3.0"
-ruff = "^0.16.0"
-pre-commit = "^4.0.0"
+mypy = "^2.4.0"
+ruff = "^0.17.0"
+pre-commit = "^4.7.0"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
