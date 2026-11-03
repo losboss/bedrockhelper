@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.2](https://github.com/losboss/bedrockhelper/compare/bedrockhelper-v1.2.1...bedrockhelper-v1.2.2) (2026-11-03)
+
+
+### Bug Fixes
+
+* keep assumed-role credentials refreshable ([#63](https://github.com/losboss/bedrockhelper/issues/63)) ([cf05664](https://github.com/losboss/bedrockhelper/commit/cf05664aaa88b76e1a0257224751d393ba7a4f1e))
+
 ## [1.2.1](https://github.com/losboss/bedrockhelper/compare/bedrockhelper-v1.2.0...bedrockhelper-v1.2.1) (2026-10-14)
 
 
