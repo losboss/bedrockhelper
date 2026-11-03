@@ -176,9 +176,10 @@ class _BotoSessionManager:
 			refresh_using=fetcher.fetch_credentials,
 		)
 
-		# Attach refreshable creds to botocore session.
+		# Attach refreshable creds to botocore session. botocore has no public setter for a
+		# credentials object; set_credentials() would replace it with a static snapshot that
+		# never refreshes, so the session would fail once the first AssumeRole creds expire.
 		bc._credentials = refreshable  # type: ignore[attr-defined]  # noqa: SLF001
-		bc.set_credentials(refreshable.access_key, refreshable.secret_key, refreshable.token)
 
 		return boto3.Session(botocore_session=bc, region_name=self._region)
 
