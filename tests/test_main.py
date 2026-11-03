@@ -1,8 +1,10 @@
 import json
 import os
+from datetime import datetime, timedelta, timezone
 from unittest import TestCase
 from unittest.mock import Mock, patch
 
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 from bedrockhelper.main import (
@@ -217,6 +219,48 @@ class TestBotoSessionManager(TestCase):
 
 		self.assertIs(c1, c2)
 		mock_session.client.assert_called_once()
+
+	@patch.object(_BotoSessionManager, '_is_already_assumed_role', return_value=False)
+	@patch('bedrockhelper.main.AssumeRoleCredentialFetcher')
+	@patch.dict(
+		os.environ,
+		{
+			'AWS_ACCESS_KEY_ID': 'SOURCE',
+			'AWS_SECRET_ACCESS_KEY': 'SOURCE',
+			'AWS_CONFIG_FILE': os.devnull,
+			'AWS_SHARED_CREDENTIALS_FILE': os.devnull,
+		},
+		clear=True,
+	)
+	def test_assumed_role_credentials_refresh_after_expiry(self, mock_fetcher_cls, _mock_already):
+		# Each AssumeRole returns new keys that are already inside botocore's
+		# mandatory refresh window, so every read must go back to STS.
+		fetches = []
+
+		def fetch_credentials():
+			fetches.append(None)
+			expiry = datetime.now(timezone.utc) + timedelta(seconds=30)
+			return {
+				'access_key': f'ASSUMED{len(fetches)}',
+				'secret_key': 'secret',
+				'token': f'token{len(fetches)}',
+				'expiry_time': expiry.isoformat(),
+			}
+
+		mock_fetcher_cls.return_value.fetch_credentials = fetch_credentials
+
+		mgr = _BotoSessionManager(
+			region_name='us-east-1',
+			botocore_config=Config(),
+			role_arn='arn:aws:iam::123456789012:role/test',
+		)
+		creds = mgr._ensure_session().get_credentials()
+
+		first = creds.get_frozen_credentials().access_key
+		second = creds.get_frozen_credentials().access_key
+
+		self.assertTrue(first.startswith('ASSUMED'))
+		self.assertNotEqual(first, second)
 
 
 class TestBedrockHelperInit(TestCase):
