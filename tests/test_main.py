@@ -380,6 +380,28 @@ class TestExtractMetricsFromResponse(TestCase):
 		self.assertIsNone(metrics.input_tokens)
 		self.assertIsNone(metrics.output_tokens)
 
+	def test_should_use_next_usage_key_when_first_is_not_a_number(self):
+		body = {'usage': {'inputTokens': 'n/a', 'input_tokens': 7}}
+
+		metrics = BedrockHelper._extract_metrics_from_response({}, body)
+
+		self.assertEqual(metrics.input_tokens, 7)
+
+	def test_should_keep_usage_counts_when_invocation_metrics_are_not_numbers(self):
+		body = {
+			'usage': {'inputTokens': 12, 'outputTokens': 3},
+			'amazon-bedrock-invocationMetrics': {'inputTokenCount': 'bad', 'outputTokenCount': None},
+		}
+
+		metrics = BedrockHelper._extract_metrics_from_response({}, body)
+
+		self.assertEqual((metrics.input_tokens, metrics.output_tokens), (12, 3))
+
+	def test_should_leave_latency_unset_when_latency_ms_is_not_a_number(self):
+		metrics = BedrockHelper._extract_metrics_from_response({}, {'metrics': {'latencyMs': 'soon'}})
+
+		self.assertIsNone(metrics.invocation_latency_ms)
+
 
 class TestGenerateWithRAG(TestCase):
 	def setUp(self):
@@ -884,6 +906,21 @@ class TestBatchEmbeddings(TestCase):
 		self.assertIsInstance(result, BatchJobResponse)
 		self.assertIn('test-job', result.job_id)
 		self.mock_s3.upload_file.assert_called_once()
+
+	def test_should_raise_job_error_and_warn_when_temp_file_cannot_be_deleted(self):
+		self.mock_bedrock.create_model_invocation_job.side_effect = RuntimeError('job rejected')
+
+		with patch('bedrockhelper.main.os.remove', side_effect=PermissionError('locked')):
+			with self.assertLogs('bedrockhelper.main', level='WARNING') as logs:
+				with self.assertRaisesRegex(RuntimeError, 'job rejected'):
+					self.helper.submit_embedding_batch_job(
+						[('id1', 'text1')],
+						s3_bucket='test-bucket',
+						s3_prefix='prefix',
+						role_arn='arn:aws:iam::123456789012:role/test',
+					)
+
+		self.assertIn('Could not delete batch input file', logs.output[0])
 
 	def test_submit_batch_job_no_bucket(self):
 		with self.assertRaises(ValueError) as ctx:

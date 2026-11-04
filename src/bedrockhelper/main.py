@@ -53,6 +53,21 @@ _T = TypeVar('_T')
 log = logging.getLogger(__name__)
 
 
+def _to_int(value: Any, default: int | None = None) -> int | None:
+	"""
+	A metric as an int, or `default` when it is missing or not a number.
+
+	Metrics are informational: one Bedrock reports in an unexpected form is
+	left unset rather than failing a request that otherwise succeeded.
+	"""
+	if value is None:
+		return default
+	try:
+		return int(value)
+	except (TypeError, ValueError):
+		return default
+
+
 class BedrockHelper:
 	"""
 	Utility class for interacting with Amazon Bedrock.
@@ -209,15 +224,7 @@ class BedrockHelper:
 				metrics.usage = usage
 
 				def _pick_int(*keys: str) -> int | None:
-					for k in keys:
-						v = usage.get(k)
-						if v is None:
-							continue
-						try:
-							return int(v)
-						except (TypeError, ValueError):
-							pass
-					return None
+					return next((n for n in (_to_int(usage.get(k)) for k in keys) if n is not None), None)
 
 				metrics.input_tokens = _pick_int(
 					'inputTokens',
@@ -236,54 +243,19 @@ class BedrockHelper:
 			# Converse responses, and the metadata event that ends a ConverseStream.
 			converse_metrics = response_body.get('metrics')
 			if isinstance(converse_metrics, dict):
-				latency = converse_metrics.get('latencyMs')
-				if latency is not None:
-					try:
-						metrics.invocation_latency_ms = int(latency)
-					except (TypeError, ValueError):
-						pass
+				metrics.invocation_latency_ms = _to_int(converse_metrics.get('latencyMs'))
 
 			# Titan embed frequently uses inputTextTokenCount rather than a usage dict
 			if metrics.input_tokens is None:
-				itc = response_body.get('inputTextTokenCount')
-				if itc is not None:
-					try:
-						metrics.input_tokens = int(itc)
-					except (TypeError, ValueError):
-						pass
+				metrics.input_tokens = _to_int(response_body.get('inputTextTokenCount'))
 
-			# Some responses embed invocation metrics under this key
-			if response_body:
-				inv = response_body.get('amazon-bedrock-invocationMetrics')
-				if isinstance(inv, dict):
-					# Tail-preferred: overwrite if present
-					itc = inv.get('inputTokenCount')
-					if itc is not None:
-						try:
-							metrics.input_tokens = int(itc)
-						except (TypeError, ValueError):
-							pass
-
-					otc = inv.get('outputTokenCount')
-					if otc is not None:
-						try:
-							metrics.output_tokens = int(otc)
-						except (TypeError, ValueError):
-							pass
-
-					il = inv.get('invocationLatency')
-					if il is not None:
-						try:
-							metrics.invocation_latency_ms = int(il)
-						except (TypeError, ValueError):
-							pass
-
-					fb = inv.get('firstByteLatency')
-					if fb is not None:
-						try:
-							metrics.first_byte_latency_ms = int(fb)
-						except (TypeError, ValueError):
-							pass
+			# Bedrock's own counts (invoke_model streams) take precedence where present.
+			inv = response_body.get('amazon-bedrock-invocationMetrics')
+			if isinstance(inv, dict):
+				metrics.input_tokens = _to_int(inv.get('inputTokenCount'), metrics.input_tokens)
+				metrics.output_tokens = _to_int(inv.get('outputTokenCount'), metrics.output_tokens)
+				metrics.invocation_latency_ms = _to_int(inv.get('invocationLatency'), metrics.invocation_latency_ms)
+				metrics.first_byte_latency_ms = _to_int(inv.get('firstByteLatency'), metrics.first_byte_latency_ms)
 
 		# ---- Header metrics
 		http_headers = response.get('ResponseMetadata', {}).get('HTTPHeaders', {}) or {}
@@ -291,23 +263,14 @@ class BedrockHelper:
 			norm = normalize_headers(http_headers)
 			metrics.header_metrics = dict(norm)
 
-			def _get_int(name: str) -> int | None:
-				v = norm.get(name.lower())
-				if v is None:
-					return None
-				try:
-					return int(v)
-				except (TypeError, ValueError):
-					return None
-
 			if metrics.input_tokens is None:
-				metrics.input_tokens = _get_int('x-amzn-bedrock-input-token-count')
+				metrics.input_tokens = _to_int(norm.get('x-amzn-bedrock-input-token-count'))
 			if metrics.output_tokens is None:
-				metrics.output_tokens = _get_int('x-amzn-bedrock-output-token-count')
+				metrics.output_tokens = _to_int(norm.get('x-amzn-bedrock-output-token-count'))
 			if metrics.invocation_latency_ms is None:
-				metrics.invocation_latency_ms = _get_int('x-amzn-bedrock-invocation-latency')
+				metrics.invocation_latency_ms = _to_int(norm.get('x-amzn-bedrock-invocation-latency'))
 			if metrics.first_byte_latency_ms is None:
-				metrics.first_byte_latency_ms = _get_int('x-amzn-bedrock-first-byte-latency')
+				metrics.first_byte_latency_ms = _to_int(norm.get('x-amzn-bedrock-first-byte-latency'))
 
 		if metrics.total_tokens is None and metrics.input_tokens is not None and metrics.output_tokens is not None:
 			metrics.total_tokens = metrics.input_tokens + metrics.output_tokens
@@ -567,6 +530,8 @@ class BedrockHelper:
 				try:
 					for t in stream:
 						loop.call_soon_threadsafe(q.put_nowait, t)
+				# BaseException, as above: it is handed to the caller's iterator and
+				# result_future, and an escape would leave the iterator waiting forever.
 				except BaseException as e:
 					loop.call_soon_threadsafe(result_future.set_exception, e)
 					loop.call_soon_threadsafe(q.put_nowait, e)
@@ -742,8 +707,10 @@ class BedrockHelper:
 			if tmp_path:
 				try:
 					os.remove(tmp_path)
-				except OSError:
-					pass
+				except OSError as e:
+					# Raising from this finally block would replace the upload or job
+					# error the caller needs; a leftover temp file is only clutter.
+					log.warning('Could not delete batch input file %s: %s', tmp_path, e)
 
 	def get_batch_job(self, job_id: str) -> dict[str, Any]:
 		return self._call_with_refresh(self.bedrock.get_model_invocation_job, jobIdentifier=job_id)

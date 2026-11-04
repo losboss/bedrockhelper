@@ -29,7 +29,6 @@ class JobStore(Protocol):
 		Useful if you re-submit the same logical job, or if you want to
 		refresh stored payload fields like output_s3_uri/job_name, etc.
 		"""
-		...
 
 	def remove(self, job_id: str) -> bool:
 		"""
@@ -37,7 +36,6 @@ class JobStore(Protocol):
 
 		Returns True if a record was removed, False if it didn't exist.
 		"""
-		...
 
 	def list_unfinished_jobs(self, *, limit: int) -> list[StoredBatchJob]: ...
 
@@ -65,7 +63,6 @@ class JobStore(Protocol):
 		Optional maintenance hook.
 		Returns number of records removed.
 		"""
-		...
 
 
 class InMemoryJobStore(JobStore):
