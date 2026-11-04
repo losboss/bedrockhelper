@@ -244,6 +244,62 @@ class TestBedrockHelperInit(TestCase):
 			self.assertEqual(helper.rag_model_id, 'custom-rag')
 			self.assertEqual(helper.embedding_model_id, 'custom-embed')
 
+	def _helper(self, **kwargs):
+		return BedrockHelper(bedrock_runtime_client=Mock(), bedrock_client=Mock(), s3_client=Mock(), **kwargs)
+
+	def test_should_read_aws_environment_when_constructed_not_when_imported(self):
+		env = {
+			'AWS_REGION': 'eu-west-1',
+			'AWS_ROLE_ARN': 'arn:aws:iam::123456789012:role/Reader',
+			'AWS_ROLE_SESSION_NAME': 'worker',
+			'AWS_EXTERNAL_ID': 'ext-1',
+			'AWS_ASSUME_ROLE_DURATION': '900',
+		}
+		# bedrockhelper.main is already imported, so these are set after import.
+		with patch.dict(os.environ, env, clear=True):
+			mgr = self._helper()._session_mgr
+
+		self.assertEqual(
+			(mgr._region, mgr._role_arn, mgr._role_session_name, mgr._external_id, mgr._duration),
+			('eu-west-1', 'arn:aws:iam::123456789012:role/Reader', 'worker', 'ext-1', 900),
+		)
+
+	def test_should_use_built_in_defaults_when_environment_is_empty(self):
+		with patch.dict(os.environ, {}, clear=True):
+			mgr = self._helper()._session_mgr
+
+		self.assertEqual(
+			(mgr._region, mgr._role_arn, mgr._role_session_name, mgr._external_id, mgr._duration),
+			('ca-central-1', None, 'bedrockhelper', None, 3600),
+		)
+
+	def test_should_prefer_arguments_over_environment(self):
+		env = {'AWS_REGION': 'eu-west-1', 'AWS_ROLE_ARN': 'arn:aws:iam::123456789012:role/FromEnv'}
+		with patch.dict(os.environ, env, clear=True):
+			mgr = self._helper(
+				region_name='us-east-1',
+				role_arn='arn:aws:iam::123456789012:role/FromArg',
+				assume_role_duration_seconds=1200,
+			)._session_mgr
+
+		self.assertEqual(
+			(mgr._region, mgr._role_arn, mgr._duration),
+			('us-east-1', 'arn:aws:iam::123456789012:role/FromArg', 1200),
+		)
+
+	def test_should_assume_no_role_when_role_arn_is_explicitly_none(self):
+		env = {'AWS_ROLE_ARN': 'arn:aws:iam::123456789012:role/FromEnv', 'AWS_EXTERNAL_ID': 'ext-1'}
+		with patch.dict(os.environ, env, clear=True):
+			mgr = self._helper(role_arn=None, external_id=None)._session_mgr
+
+		self.assertIsNone(mgr._role_arn)
+		self.assertIsNone(mgr._external_id)
+
+	def test_should_name_the_variable_when_duration_is_not_a_number(self):
+		with patch.dict(os.environ, {'AWS_ASSUME_ROLE_DURATION': 'an hour'}, clear=True):
+			with self.assertRaisesRegex(ValueError, 'AWS_ASSUME_ROLE_DURATION'):
+				self._helper()
+
 	def test_invalid_max_concurrent_streams(self):
 		with self.assertRaises(ValueError):
 			BedrockHelper(

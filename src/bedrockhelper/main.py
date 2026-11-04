@@ -36,6 +36,7 @@ from bedrockhelper.types import RecordInput
 from bedrockhelper.utils import (
 	UNSET,
 	TemperatureArg,
+	Unset,
 	build_converse_request,
 	extract_converse_text,
 	format_context_passages,
@@ -84,6 +85,16 @@ def _settle(future: asyncio.Future[_T], *, result: _T | None = None, error: Base
 		future.set_result(result)  # type: ignore[arg-type]
 
 
+def _duration_from_environment() -> int:
+	raw = os.getenv('AWS_ASSUME_ROLE_DURATION')
+	if raw is None:
+		return 3600
+	try:
+		return int(raw)
+	except ValueError:
+		raise ValueError(f'AWS_ASSUME_ROLE_DURATION must be a whole number of seconds, not {raw!r}') from None
+
+
 class BedrockHelper:
 	"""
 	Utility class for interacting with Amazon Bedrock.
@@ -93,19 +104,25 @@ class BedrockHelper:
 	Important split:
 	- generate_with_rag(...) -> non-streaming only (returns full text + metrics)
 	- stream_with_rag(...)   -> streaming only (returns RAGStream which yields deltas + metrics)
+
+	Settings left out are read from the environment when the helper is
+	constructed: AWS_REGION, AWS_ROLE_ARN, AWS_ROLE_SESSION_NAME,
+	AWS_EXTERNAL_ID, AWS_ASSUME_ROLE_DURATION, AWS_MODEL_ID and
+	AWS_EMBEDDING_MODEL_ID. Passing role_arn=None (or external_id=None)
+	explicitly means none, even when the variable is set.
 	"""
 
 	def __init__(
 		self,
-		region_name: str = os.getenv('AWS_REGION', 'ca-central-1'),
+		region_name: str | None = None,
 		rag_model_id: str | None = None,
 		embedding_model_id: str | None = None,
 		*,
 		botocore_config: Config | None = None,
-		role_arn: str | None = os.getenv('AWS_ROLE_ARN'),
-		role_session_name: str = os.getenv('AWS_ROLE_SESSION_NAME', 'bedrockhelper'),
-		external_id: str | None = os.getenv('AWS_EXTERNAL_ID'),
-		assume_role_duration_seconds: int = int(os.getenv('AWS_ASSUME_ROLE_DURATION', '3600')),
+		role_arn: str | None | Unset = UNSET,
+		role_session_name: str | None = None,
+		external_id: str | None | Unset = UNSET,
+		assume_role_duration_seconds: int | None = None,
 		# injected clients (tests)
 		s3_client: Any | None = None,
 		bedrock_runtime_client: Any | None = None,
@@ -132,12 +149,16 @@ class BedrockHelper:
 			)
 
 		self._session_mgr = BotoSessionManager(
-			region_name=region_name,
+			region_name=region_name or os.getenv('AWS_REGION') or 'ca-central-1',
 			botocore_config=botocore_config,
-			role_arn=role_arn,
-			role_session_name=role_session_name,
-			external_id=external_id,
-			assume_role_duration_seconds=assume_role_duration_seconds,
+			role_arn=os.getenv('AWS_ROLE_ARN') if isinstance(role_arn, Unset) else role_arn,
+			role_session_name=role_session_name or os.getenv('AWS_ROLE_SESSION_NAME') or 'bedrockhelper',
+			external_id=os.getenv('AWS_EXTERNAL_ID') if isinstance(external_id, Unset) else external_id,
+			assume_role_duration_seconds=(
+				assume_role_duration_seconds
+				if assume_role_duration_seconds is not None
+				else _duration_from_environment()
+			),
 		)
 
 		# Track which clients were injected; we won't overwrite them on refresh.

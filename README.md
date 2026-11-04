@@ -100,9 +100,16 @@ helper = BedrockHelper(
 )
 ```
 
-`role_arn` defaults to the `AWS_ROLE_ARN` environment variable. The assumed
-credentials refresh before they expire. If the process is already running as
-that role (as on EKS, which also sets `AWS_ROLE_ARN`), it is not assumed again.
+`role_arn` defaults to the `AWS_ROLE_ARN` environment variable, read when the
+helper is created; pass `role_arn=None` to assume no role even when it is set.
+The assumed credentials refresh before they expire. If the process is already
+running as that role (as on EKS, which also sets `AWS_ROLE_ARN`), it is not
+assumed again.
+
+Other settings you leave out are read from the environment in the same way:
+`AWS_REGION` (default `ca-central-1`), `AWS_ROLE_SESSION_NAME`,
+`AWS_EXTERNAL_ID`, `AWS_ASSUME_ROLE_DURATION` (seconds, default 3600),
+`AWS_MODEL_ID` and `AWS_EMBEDDING_MODEL_ID`.
 
 ## Embeddings
 

@@ -33,7 +33,7 @@ SAMPLING_PARAM_KEYS: tuple[str, ...] = ('temperature', 'topP', 'top_p', 'topK', 
 DEFAULT_TEMPERATURE: float = 0.1
 
 
-class _Unset:
+class Unset:
 	"""Sentinel type distinguishing "caller said nothing" from an explicit value."""
 
 	def __repr__(self) -> str:  # pragma: no cover - debugging aid
@@ -44,9 +44,9 @@ class _Unset:
 #   UNSET  -> apply DEFAULT_TEMPERATURE where the model accepts it
 #   float  -> the caller's explicit choice
 #   None   -> send nothing; let the model apply its own default
-UNSET = _Unset()
+UNSET = Unset()
 
-TemperatureArg = float | None | _Unset
+TemperatureArg = float | None | Unset
 
 
 def normalize_headers(headers: Mapping[str | int, Any]) -> dict[str, Any]:
@@ -220,7 +220,7 @@ def resolve_temperature(model_id: str, temperature: TemperatureArg = UNSET) -> f
 	library's own default is not, or every call to a model like Sonnet 5 would
 	warn about a value the caller never asked for.
 	"""
-	if isinstance(temperature, _Unset):
+	if isinstance(temperature, Unset):
 		value: float | None = DEFAULT_TEMPERATURE
 		explicit = False
 	else:
