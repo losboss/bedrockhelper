@@ -1,6 +1,6 @@
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 from types import SimpleNamespace
 from typing import Any
 from unittest import TestCase
@@ -85,7 +85,7 @@ class TestInMemoryJobStore(TestCase):
 		store.add(b)
 
 		# make 'a' terminal (FAILED) so eviction prefers it
-		store.mark_checked('a', state='FAILED', last_checked_at=datetime.now(timezone.utc))
+		store.mark_checked('a', state='FAILED', last_checked_at=datetime.now(UTC))
 
 		store.add(c)  # triggers eviction
 		self.assertIsNone(store.get('a'))
@@ -143,7 +143,7 @@ class TestInMemoryJobStore(TestCase):
 		job = DummyBatchJobResponse('job-3', output_s3_uri='s3://out/v1')
 		store.add(job)
 
-		checked_at = datetime.now(timezone.utc)
+		checked_at = datetime.now(UTC)
 		store.mark_checked(
 			'job-3',
 			state='RUNNING',
@@ -199,8 +199,8 @@ class TestInMemoryJobStore(TestCase):
 		store.add(DummyBatchJobResponse('b'))
 		store.add(DummyBatchJobResponse('c'))
 
-		store.mark_checked('b', state='FAILED', last_checked_at=datetime.now(timezone.utc))
-		store.mark_processed('c', processed_at=datetime.now(timezone.utc), embeddings_count=1)
+		store.mark_checked('b', state='FAILED', last_checked_at=datetime.now(UTC))
+		store.mark_processed('c', processed_at=datetime.now(UTC), embeddings_count=1)
 
 		unfinished = store.list_unfinished_jobs(limit=10)
 		self.assertEqual([j.job.job_id for j in unfinished], ['a'])
@@ -230,7 +230,7 @@ class TestInMemoryJobStore(TestCase):
 		store = InMemoryJobStore(max_jobs=10)
 		store.add(DummyBatchJobResponse('job-5'))
 
-		now = datetime.now(timezone.utc)
+		now = datetime.now(UTC)
 		store.mark_checked(
 			'job-5',
 			state='FAILED',
@@ -251,7 +251,7 @@ class TestInMemoryJobStore(TestCase):
 		store = InMemoryJobStore(max_jobs=10)
 		store.add(DummyBatchJobResponse('job-6'))
 
-		t1 = datetime.now(timezone.utc)
+		t1 = datetime.now(UTC)
 		store.mark_checked(
 			'job-6',
 			state='RUNNING',
@@ -278,14 +278,14 @@ class TestInMemoryJobStore(TestCase):
 	# ---------------------------
 	def test_mark_processed_noop_when_missing(self):
 		store = InMemoryJobStore(max_jobs=10)
-		store.mark_processed('missing', processed_at=datetime.now(timezone.utc), embeddings_count=1)
+		store.mark_processed('missing', processed_at=datetime.now(UTC), embeddings_count=1)
 
 	def test_mark_processed_sets_processed_state_and_clears_error(self):
 		store = InMemoryJobStore(max_jobs=10)
 		store.add(DummyBatchJobResponse('job-7'))
 		store.mark_checked('job-7', last_error='err', attempts=2)
 
-		pa = datetime.now(timezone.utc)
+		pa = datetime.now(UTC)
 		store.mark_processed('job-7', processed_at=pa, embeddings_count=5)
 
 		cur = store.get('job-7')
@@ -304,7 +304,7 @@ class TestInMemoryJobStore(TestCase):
 		store.add(DummyBatchJobResponse('keep-terminal-young'))
 		store.add(DummyBatchJobResponse('drop-terminal-old'))
 
-		now = datetime.now(timezone.utc)
+		now = datetime.now(UTC)
 
 		# terminal young: processed_at within TTL
 		store.mark_processed('keep-terminal-young', processed_at=now, embeddings_count=1)
@@ -325,7 +325,7 @@ class TestInMemoryJobStore(TestCase):
 		store.add(DummyBatchJobResponse('failed-old-by-created'))
 
 		# failed with last_checked_at old
-		old_ts = datetime.fromtimestamp(time.time() - 2.0, tz=timezone.utc)
+		old_ts = datetime.fromtimestamp(time.time() - 2.0, tz=UTC)
 		store.mark_checked('failed-old-by-last_checked', state='FAILED', last_checked_at=old_ts)
 
 		# failed without last_checked_at -> anchor becomes created_at; force it old by hacking internal state
@@ -360,8 +360,8 @@ class TestInMemoryJobStore(TestCase):
 		time.sleep(0.01)
 		store.add(DummyBatchJobResponse('n1'))
 
-		store.mark_checked('t1', state='FAILED', last_checked_at=datetime.now(timezone.utc))
-		store.mark_processed('t2', processed_at=datetime.now(timezone.utc), embeddings_count=1)
+		store.mark_checked('t1', state='FAILED', last_checked_at=datetime.now(UTC))
+		store.mark_processed('t2', processed_at=datetime.now(UTC), embeddings_count=1)
 
 		# direct call to cover branch
 		with store._lock:
@@ -383,3 +383,16 @@ class TestInMemoryJobStore(TestCase):
 
 		self.assertIsNone(store.get('oldest'))
 		self.assertIsNotNone(store.get('newer'))
+
+
+class TestInMemoryJobStoreKeepsDebug(TestCase):
+	def test_debug_survives_mark_checked_and_mark_processed(self):
+		store = InMemoryJobStore()
+		store.add(DummyBatchJobResponse('job-1'))
+		store.get('job-1').debug['note'] = 'kept'
+
+		store.mark_checked('job-1', state='RUNNING', attempts=1)
+		self.assertEqual(store.get('job-1').debug, {'note': 'kept'})
+
+		store.mark_processed('job-1', processed_at=datetime.now(UTC), embeddings_count=3)
+		self.assertEqual(store.get('job-1').debug, {'note': 'kept'})

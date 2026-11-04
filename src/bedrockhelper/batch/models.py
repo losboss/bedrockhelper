@@ -2,22 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Any
 
+# Defined beside BatchJobResponse, which builds it; re-exported here for existing imports.
+from bedrockhelper.models import BatchJobRef
 
-@dataclass(frozen=True, slots=True)
-class BatchJobRef:
-	"""
-	Minimal, durable information needed to reconcile a Bedrock batch job later.
-
-	Intentionally excludes large/unstable provider payloads.
-	"""
-
-	job_id: str
-	job_name: str
-	model_id: str
-	input_s3_uri: str
-	output_s3_uri: str
+__all__ = ['BatchJobRef', 'StoredBatchJob']
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,11 +21,11 @@ class StoredBatchJob:
 	job: BatchJobRef
 	state: str  # "SUBMITTED" | "RUNNING" | "COMPLETED" | "FAILED" | "PROCESSED"
 	created_at: datetime
-	last_checked_at: Optional[datetime] = None
+	last_checked_at: datetime | None = None
 	attempts: int = 0
-	last_error: Optional[str] = None
-	bedrock_status: Optional[str] = None
-	processed_at: Optional[datetime] = None
-	embeddings_count: Optional[int] = None
+	last_error: str | None = None
+	bedrock_status: str | None = None
+	processed_at: datetime | None = None
+	embeddings_count: int | None = None
 
-	debug: Dict[str, Any] = field(default_factory=dict)
+	debug: dict[str, Any] = field(default_factory=dict)

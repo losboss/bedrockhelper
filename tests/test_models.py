@@ -75,12 +75,11 @@ class TestRAGStream(TestCase):
 		def iterator_factory():
 			yield from chunks
 
-		def build_final(full_text: str, tail_body):
+		def build_final(full_text: str):
 			return RAGResponse(
 				text=full_text,
 				stream=True,
 				metrics=InvocationMetrics(input_tokens=10, output_tokens=len(full_text)),
-				raw_response=tail_body,
 			)
 
 		return RAGStream(
@@ -110,11 +109,7 @@ class TestRAGStream(TestCase):
 			_ = stream.result
 		self.assertIn('not finished yet', str(ctx.exception))
 
-	def test_set_tail_body(self):
-		stream = self._make_stream(['hello'])
-		# Set tail body before iteration
-		stream._set_tail_body({'usage': {'tokens': 5}})
-		# Iterate to completion
-		list(stream)
-		# Result should have the tail body
-		self.assertEqual(stream.result.raw_response, {'usage': {'tokens': 5}})
+	def test_result_holds_full_text_after_iteration(self):
+		stream = self._make_stream(['hello', ' world'])
+		self.assertEqual(list(stream), ['hello', ' world'])
+		self.assertEqual(stream.result.text, 'hello world')

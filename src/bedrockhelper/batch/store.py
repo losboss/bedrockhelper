@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import dataclasses
 import threading
 import time
-from datetime import datetime, timezone
-from typing import Dict, List, Optional, Protocol
+from datetime import datetime, UTC
+from typing import Protocol
 
 from bedrockhelper.batch.models import StoredBatchJob
 from bedrockhelper.models import BatchJobResponse
@@ -19,7 +20,7 @@ class JobStore(Protocol):
 
 	def add(self, job: BatchJobResponse) -> None: ...
 
-	def get(self, job_id: str) -> Optional[StoredBatchJob]: ...
+	def get(self, job_id: str) -> StoredBatchJob | None: ...
 
 	def upsert(self, job: BatchJobResponse) -> None:
 		"""
@@ -38,17 +39,17 @@ class JobStore(Protocol):
 		"""
 		...
 
-	def list_unfinished_jobs(self, *, limit: int) -> List[StoredBatchJob]: ...
+	def list_unfinished_jobs(self, *, limit: int) -> list[StoredBatchJob]: ...
 
 	def mark_checked(
 		self,
 		job_id: str,
 		*,
-		state: Optional[str] = None,
-		last_checked_at: Optional[datetime] = None,
-		attempts: Optional[int] = None,
-		last_error: Optional[str] = None,
-		bedrock_status: Optional[str] = None,
+		state: str | None = None,
+		last_checked_at: datetime | None = None,
+		attempts: int | None = None,
+		last_error: str | None = None,
+		bedrock_status: str | None = None,
 	) -> None: ...
 
 	def mark_processed(
@@ -96,10 +97,10 @@ class InMemoryJobStore(JobStore):
 		self._terminal_ttl_seconds = terminal_ttl_seconds
 
 		self._lock = threading.RLock()
-		self._jobs: Dict[str, StoredBatchJob] = {}
+		self._jobs: dict[str, StoredBatchJob] = {}
 
 	def add(self, job: BatchJobResponse) -> None:
-		now = datetime.now(timezone.utc)
+		now = datetime.now(UTC)
 		job_ref = job.to_ref()
 
 		with self._lock:
@@ -115,12 +116,12 @@ class InMemoryJobStore(JobStore):
 				created_at=now,
 			)
 
-	def get(self, job_id: str) -> Optional[StoredBatchJob]:
+	def get(self, job_id: str) -> StoredBatchJob | None:
 		with self._lock:
 			return self._jobs.get(job_id)
 
 	def upsert(self, job: BatchJobResponse) -> None:
-		now = datetime.now(timezone.utc)
+		now = datetime.now(UTC)
 		job_ref = job.to_ref()
 
 		with self._lock:
@@ -152,7 +153,7 @@ class InMemoryJobStore(JobStore):
 		with self._lock:
 			return self._jobs.pop(job_id, None) is not None
 
-	def list_unfinished_jobs(self, *, limit: int) -> List[StoredBatchJob]:
+	def list_unfinished_jobs(self, *, limit: int) -> list[StoredBatchJob]:
 		if limit < 1:
 			return []
 		with self._lock:
@@ -165,27 +166,24 @@ class InMemoryJobStore(JobStore):
 		self,
 		job_id: str,
 		*,
-		state: Optional[str] = None,
-		last_checked_at: Optional[datetime] = None,
-		attempts: Optional[int] = None,
-		last_error: Optional[str] = None,
-		bedrock_status: Optional[str] = None,
+		state: str | None = None,
+		last_checked_at: datetime | None = None,
+		attempts: int | None = None,
+		last_error: str | None = None,
+		bedrock_status: str | None = None,
 	) -> None:
 		with self._lock:
 			cur = self._jobs.get(job_id)
 			if cur is None:
 				return
 
-			self._jobs[job_id] = StoredBatchJob(
-				job=cur.job,
+			self._jobs[job_id] = dataclasses.replace(
+				cur,
 				state=state or cur.state,
-				created_at=cur.created_at,
 				last_checked_at=last_checked_at or cur.last_checked_at,
 				attempts=attempts if attempts is not None else cur.attempts,
 				last_error=last_error if last_error is not None else cur.last_error,
 				bedrock_status=bedrock_status if bedrock_status is not None else cur.bedrock_status,
-				processed_at=cur.processed_at,
-				embeddings_count=cur.embeddings_count,
 			)
 
 	def mark_processed(
@@ -200,14 +198,10 @@ class InMemoryJobStore(JobStore):
 			if cur is None:
 				return
 
-			self._jobs[job_id] = StoredBatchJob(
-				job=cur.job,
+			self._jobs[job_id] = dataclasses.replace(
+				cur,
 				state='PROCESSED',
-				created_at=cur.created_at,
-				last_checked_at=cur.last_checked_at,
-				attempts=cur.attempts,
 				last_error=None,
-				bedrock_status=cur.bedrock_status,
 				processed_at=processed_at,
 				embeddings_count=embeddings_count,
 			)
@@ -219,7 +213,7 @@ class InMemoryJobStore(JobStore):
 		now = time.time()
 		removed = 0
 		with self._lock:
-			to_delete: List[str] = []
+			to_delete: list[str] = []
 			for job_id, stored in self._jobs.items():
 				if stored.state not in ('FAILED', 'PROCESSED'):
 					continue
