@@ -1,16 +1,11 @@
-import ast
 import json
 import logging
-import threading
-from queue import Queue
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple, Union
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from typing import Any
 
 from bedrockhelper.types import RecordInput
 
 log = logging.getLogger(__name__)
-
-DEFAULT_STOP_TYPES_INVOKE: Tuple[str, ...] = ('message_stop', 'completion_stop', 'end')
-DEFAULT_STOP_KEYS_CONVERSE: Tuple[str, ...] = ('messageStop', 'message_stop', 'stop', 'end')
 
 # Model families that reject sampling parameters (temperature / topP / topK).
 # Anthropic removed them on Opus 4.7+, Fable 5 and Mythos 5; Sonnet 5 rejects
@@ -19,7 +14,7 @@ DEFAULT_STOP_KEYS_CONVERSE: Tuple[str, ...] = ('messageStop', 'message_stop', 's
 #
 # Sonnet 4.5 and Haiku 4.5 are deliberately absent: they accept temperature on
 # its own and only reject it alongside topP, which the retry path handles.
-MODELS_WITHOUT_SAMPLING_PARAMS: Tuple[str, ...] = (
+MODELS_WITHOUT_SAMPLING_PARAMS: tuple[str, ...] = (
 	'claude-opus-4-7',
 	'claude-opus-4-8',
 	'claude-opus-5',
@@ -29,7 +24,7 @@ MODELS_WITHOUT_SAMPLING_PARAMS: Tuple[str, ...] = (
 )
 
 # Keys removed from a request when a model rejects sampling parameters.
-SAMPLING_PARAM_KEYS: Tuple[str, ...] = ('temperature', 'topP', 'top_p', 'topK', 'top_k')
+SAMPLING_PARAM_KEYS: tuple[str, ...] = ('temperature', 'topP', 'top_p', 'topK', 'top_k')
 
 # Applied when the caller does not specify a temperature, on models that accept
 # one. Kept deliberately low: this library is aimed at RAG, where grounded,
@@ -38,7 +33,7 @@ SAMPLING_PARAM_KEYS: Tuple[str, ...] = ('temperature', 'topP', 'top_p', 'topK', 
 DEFAULT_TEMPERATURE: float = 0.1
 
 
-class _Unset:
+class Unset:
 	"""Sentinel type distinguishing "caller said nothing" from an explicit value."""
 
 	def __repr__(self) -> str:  # pragma: no cover - debugging aid
@@ -49,119 +44,12 @@ class _Unset:
 #   UNSET  -> apply DEFAULT_TEMPERATURE where the model accepts it
 #   float  -> the caller's explicit choice
 #   None   -> send nothing; let the model apply its own default
-UNSET = _Unset()
+UNSET = Unset()
 
-TemperatureArg = Union[float, None, _Unset]
-
-_SENTINEL = object()
+TemperatureArg = float | None | Unset
 
 
-def iter_bedrock_stream_text(
-	event_stream: Iterable[dict[str, Any]],
-	*,
-	on_text: Callable[[str], None],
-	stream_kind: str = 'auto',
-	invoke_stop_types: Tuple[str, ...] = DEFAULT_STOP_TYPES_INVOKE,
-	converse_stop_keys: Tuple[str, ...] = DEFAULT_STOP_KEYS_CONVERSE,
-	decode: str = 'utf-8',
-) -> None:
-	"""
-	Iterate a Bedrock streaming event stream and call `on_text(...)` for each text delta.
-	"""
-
-	def _handle_invoke_event(event: dict[str, Any]) -> bool:
-		# Returns True if should stop
-		chunk = event.get('chunk')
-		if not chunk:
-			return False
-
-		raw = chunk.get('bytes')
-		if not raw:
-			return False
-
-		try:
-			msg = json.loads(raw.decode(decode))
-		except Exception:
-			return False
-		if not isinstance(msg, dict):
-			return False
-		delta = msg.get('delta')
-		if isinstance(delta, dict):
-			t = delta.get('text')
-			if isinstance(t, str) and t:
-				on_text(t)
-
-		if msg.get('type') in invoke_stop_types:
-			return True
-		return False
-
-	def _handle_converse_event(event: dict[str, Any]) -> bool:
-		# Returns True if should stop
-		cbd = event.get('contentBlockDelta') or event.get('content_block_delta')
-		if isinstance(cbd, dict):
-			delta = cbd.get('delta')
-			if isinstance(delta, dict):
-				t = delta.get('text')
-				if isinstance(t, str) and t:
-					on_text(t)
-
-		for k in converse_stop_keys:
-			if k in event and event.get(k):
-				return True
-
-		ms = event.get('messageStop') or event.get('message_stop')
-		if isinstance(ms, dict) and ms:
-			return True
-
-		return False
-
-	for event_item in event_stream:
-		if not isinstance(event_item, dict):
-			continue
-
-		kind = stream_kind
-
-		if kind == 'auto':
-			# Prefer converse when a converse-like shape or stop key is present.
-			has_converse = False
-			if (
-				'contentBlockDelta' in event_item
-				or 'content_block_delta' in event_item
-				or 'messageStop' in event_item
-				or 'message_stop' in event_item
-			):
-				has_converse = True
-			else:
-				for k in converse_stop_keys:
-					if k in event_item and event_item.get(k):
-						has_converse = True
-						break
-
-			if has_converse:
-				should_stop = _handle_converse_event(event_item)
-				if should_stop:
-					break
-				# Do not also treat the same event as an invoke event.
-				continue
-
-			# If no converse signal, but a chunk is present, treat as invoke.
-			if 'chunk' in event_item:
-				kind = 'invoke'
-			else:
-				# nothing recognizable in auto mode; skip
-				continue
-
-		if kind == 'invoke':
-			should_stop = _handle_invoke_event(event_item)
-			if should_stop:
-				break
-		else:  # explicit "converse"
-			should_stop = _handle_converse_event(event_item)
-			if should_stop:
-				break
-
-
-def normalize_headers(headers: Mapping[str | int, Any]) -> Dict[str, Any]:
+def normalize_headers(headers: Mapping[str | int, Any]) -> dict[str, Any]:
 	return {str(k).lower(): v for k, v in headers.items()}
 
 
@@ -172,7 +60,7 @@ def format_context_passages(
 	header_template: str = '--- passage {i} ---',
 	separator: str = '\n\n',
 ) -> str:
-	blocks: List[str] = []
+	blocks: list[str] = []
 	for i, p in enumerate(passages, start=1):
 		text = str(p)
 		if include_headers:
@@ -182,7 +70,7 @@ def format_context_passages(
 	return separator.join(blocks)
 
 
-def truncate_by_chars(text: str, max_chars: Optional[int]) -> str:
+def truncate_by_chars(text: str, max_chars: int | None) -> str:
 	if max_chars is None:
 		return text
 	if max_chars <= 0:
@@ -190,11 +78,11 @@ def truncate_by_chars(text: str, max_chars: Optional[int]) -> str:
 	return text[:max_chars]
 
 
-def normalize_records(records: RecordInput) -> List[Tuple[str, str]]:
+def normalize_records(records: RecordInput) -> list[tuple[str, str]]:
 	if isinstance(records, dict):
 		return [(str(k), v) for k, v in records.items()]
 
-	out: List[Tuple[str, str]] = []
+	out: list[tuple[str, str]] = []
 	for item in records:
 		if isinstance(item, tuple) and len(item) == 2:
 			out.append((str(item[0]), item[1]))
@@ -209,21 +97,62 @@ def normalize_records(records: RecordInput) -> List[Tuple[str, str]]:
 	return out
 
 
-def extract_converse_text(resp: dict[str, Any]) -> str:
+def extract_converse_text(resp: Mapping[str, Any]) -> str:
 	"""
 	Extract final assistant text from a Bedrock converse() response.
 	"""
-	try:
-		content = resp.get('output', {}).get('message', {}).get('content', [])
-		parts: List[str] = []
-		for item in content:
-			if isinstance(item, dict):
-				t = item.get('text')
-				if isinstance(t, str):
-					parts.append(t)
-		return ''.join(parts)
-	except Exception:
+	output = resp.get('output')
+	message = output.get('message') if isinstance(output, Mapping) else None
+	content = message.get('content') if isinstance(message, Mapping) else None
+	if not isinstance(content, list):
 		return ''
+	return ''.join(item['text'] for item in content if isinstance(item, Mapping) and isinstance(item.get('text'), str))
+
+
+def iter_stream_text(
+	event_stream: Iterable[Mapping[str, Any]],
+	*,
+	on_metrics: Callable[[dict[str, Any]], None],
+) -> Iterator[str]:
+	"""
+	Yield the text deltas of a Bedrock response stream, passing end-of-stream metrics to `on_metrics`.
+
+	Reads the stream to the end: the metrics arrive after the text has finished.
+
+	- converse_stream(): text is in `contentBlockDelta` events; token usage and
+	  latency come in the final `metadata` event, after `messageStop`. That
+	  event's body ({'usage': ..., 'metrics': ...}) is passed on.
+	- invoke_model_with_response_stream() with an Anthropic Messages body: each
+	  event is `{'chunk': {'bytes': b'<json>'}}`; text is in `content_block_delta`
+	  messages, and Bedrock adds `amazon-bedrock-invocationMetrics` to the final
+	  `message_stop` message. A dict holding that key is passed on.
+	"""
+	for event in event_stream:
+		block_delta = event.get('contentBlockDelta')
+		if isinstance(block_delta, Mapping):
+			text = (block_delta.get('delta') or {}).get('text')
+			if isinstance(text, str) and text:
+				yield text
+			continue
+
+		metadata = event.get('metadata')
+		if isinstance(metadata, Mapping):
+			on_metrics(dict(metadata))
+			continue
+
+		chunk = event.get('chunk')
+		if isinstance(chunk, Mapping) and isinstance(chunk.get('bytes'), bytes):
+			msg = json.loads(chunk['bytes'])
+			if not isinstance(msg, dict):
+				continue
+			delta = msg.get('delta')
+			if isinstance(delta, Mapping):
+				text = delta.get('text')
+				if isinstance(text, str) and text:
+					yield text
+			invocation_metrics = msg.get('amazon-bedrock-invocationMetrics')
+			if isinstance(invocation_metrics, Mapping):
+				on_metrics({'amazon-bedrock-invocationMetrics': dict(invocation_metrics)})
 
 
 def supports_sampling_params(model_id: str) -> bool:
@@ -237,7 +166,7 @@ def supports_sampling_params(model_id: str) -> bool:
 	return not any(family in lowered for family in MODELS_WITHOUT_SAMPLING_PARAMS)
 
 
-def strip_sampling_params(request: Mapping[str, Any]) -> Tuple[Dict[str, Any], bool]:
+def strip_sampling_params(request: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
 	"""
 	Return a copy of a request with sampling parameters removed, along with
 	whether anything was actually removed.
@@ -283,7 +212,7 @@ def is_sampling_param_error(exc: BaseException) -> bool:
 	return any(key.lower() in message for key in SAMPLING_PARAM_KEYS)
 
 
-def resolve_temperature(model_id: str, temperature: TemperatureArg = UNSET) -> Optional[float]:
+def resolve_temperature(model_id: str, temperature: TemperatureArg = UNSET) -> float | None:
 	"""
 	Decide the temperature to send for a model, or None to omit it entirely.
 
@@ -291,8 +220,8 @@ def resolve_temperature(model_id: str, temperature: TemperatureArg = UNSET) -> O
 	library's own default is not, or every call to a model like Sonnet 5 would
 	warn about a value the caller never asked for.
 	"""
-	if isinstance(temperature, _Unset):
-		value: Optional[float] = DEFAULT_TEMPERATURE
+	if isinstance(temperature, Unset):
+		value: float | None = DEFAULT_TEMPERATURE
 		explicit = False
 	else:
 		value = temperature
@@ -321,7 +250,7 @@ def build_converse_request(
 	temperature: TemperatureArg = UNSET,
 	rag_instructions: str = '',
 	**extra_params: Any,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
 	"""
 	Build the shared request payload for converse() and converse_stream().
 
@@ -335,12 +264,12 @@ def build_converse_request(
 	if rag_instructions:
 		user_text = f'{rag_instructions}\n{user_text}'
 
-	inference_config: Dict[str, Any] = {'maxTokens': max_tokens}
+	inference_config: dict[str, Any] = {'maxTokens': max_tokens}
 	resolved = resolve_temperature(model_id, temperature)
 	if resolved is not None:
 		inference_config['temperature'] = resolved
 
-	req: Dict[str, Any] = {
+	req: dict[str, Any] = {
 		'modelId': model_id,
 		'system': [{'text': system_prompt}],
 		'messages': [
@@ -350,7 +279,6 @@ def build_converse_request(
 			}
 		],
 		'inferenceConfig': inference_config,
-		# Enable usage metrics in streaming responses
 		'performanceConfig': {
 			'latency': 'standard'  # or 'optimized'
 		},
@@ -375,141 +303,3 @@ def normalize_s3_bucket_name(bucket: str) -> str:
 	if bucket.startswith('s3://'):
 		return bucket[len('s3://') :]
 	return bucket
-
-
-def _decode_bedrock_chunk_bytes(raw: Any, *, decode: str = 'utf-8') -> Optional[str]:
-	"""
-	Bedrock streaming 'chunk.bytes' is usually bytes, but can sometimes appear as:
-	- a str that is already JSON, or
-	- a str that looks like a Python bytes literal: "b'...'"
-	Return decoded text or None if we can't decode.
-	"""
-	if raw is None:
-		return None
-
-	# Normal case: bytes
-	if isinstance(raw, (bytes, bytearray)):
-		return bytes(raw).decode(decode, errors='replace')
-
-	# Sometimes: already-decoded JSON string
-	if isinstance(raw, str):
-		s = raw.strip()
-
-		# If it looks like b'...'
-		if (s.startswith("b'") and s.endswith("'")) or (s.startswith('b"') and s.endswith('"')):
-			try:
-				b = ast.literal_eval(s)  # -> bytes
-				if isinstance(b, (bytes, bytearray)):
-					return bytes(b).decode(decode, errors='replace')
-			except Exception:
-				return None
-
-		# Otherwise assume it's JSON text already
-		return s
-
-	return None
-
-
-def _iter_stream_with_callback(event_stream: Iterable[dict[str, Any]], *, stream_kind: str) -> Iterator[str]:
-	"""
-	Adapt iter_bedrock_stream_text(callback-based) into an Iterator[str].
-	Ensures the underlying stream is closed when the iterator ends.
-	"""
-	q: 'Queue[object]' = Queue()
-	err: dict[str, BaseException] = {}
-
-	def on_text(t: str) -> None:
-		q.put(t)
-
-	def worker() -> None:
-		try:
-			iter_bedrock_stream_text(event_stream, on_text=on_text, stream_kind=stream_kind)
-		except BaseException as e:
-			err['exc'] = e
-		finally:
-			try:
-				if hasattr(event_stream, 'close'):
-					event_stream.close()
-			finally:
-				q.put(_SENTINEL)
-
-	threading.Thread(target=worker, daemon=True).start()
-
-	while True:
-		item = q.get()
-		if item is _SENTINEL:
-			break
-		assert isinstance(item, str)
-		yield item
-
-	if 'exc' in err:
-		raise err['exc']
-
-
-def iter_bedrock_stream_text_gen_with_tail(
-	event_stream: Iterable[dict[str, Any]],
-	*,
-	decode: str = 'utf-8',
-	on_tail: Callable[[dict[str, Any]], None],
-) -> Iterator[str]:
-	"""
-	Yield text deltas. Best-effort: whenever we parse a JSON message that contains
-	usage/metrics-ish fields, we call on_tail(msg).
-	"""
-
-	def _maybe_capture_tail(msg: Any) -> None:
-		if not isinstance(msg, dict):
-			return
-		# best-effort heuristics
-		if (
-			'usage' in msg
-			or 'amazon-bedrock-invocationMetrics' in msg
-			or 'invocationMetrics' in msg
-			or 'messageStop' in msg
-			or 'message_stop' in msg
-		):
-			on_tail(msg)
-
-	for event_item in event_stream:
-		if not isinstance(event_item, dict):
-			continue
-
-		if 'messageStop' in event_item or 'message_stop' in event_item:
-			_maybe_capture_tail(event_item)
-			break
-
-		# INVOKE shape: {"chunk": {"bytes": b"...json..."}}
-		if 'chunk' in event_item and isinstance(event_item.get('chunk'), dict):
-			raw = event_item['chunk'].get('bytes')
-			text = _decode_bedrock_chunk_bytes(raw, decode=decode)
-			if not text:
-				continue
-			try:
-				msg = json.loads(text)
-			except Exception:
-				continue
-
-			_maybe_capture_tail(msg)
-
-			if not isinstance(msg, dict):
-				continue
-			delta = msg.get('delta')
-			if isinstance(delta, dict):
-				t = delta.get('text')
-				if isinstance(t, str) and t:
-					yield t
-
-			# stop condition
-			if msg.get('type') in ('message_stop', 'messageStop', 'stop', 'end_turn', 'endTurn'):
-				break
-
-		# CONVERSE-like shape: {"contentBlockDelta": {"delta": {"text": "..."}}} etc.
-		if 'contentBlockDelta' in event_item or 'content_block_delta' in event_item:
-			_maybe_capture_tail(event_item)
-			cbd = event_item.get('contentBlockDelta') or event_item.get('content_block_delta')
-			if isinstance(cbd, dict):
-				delta = cbd.get('delta')
-				if isinstance(delta, dict):
-					t = delta.get('text')
-					if isinstance(t, str) and t:
-						yield t

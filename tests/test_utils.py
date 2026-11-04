@@ -3,16 +3,15 @@ from unittest import TestCase
 
 from botocore.exceptions import ClientError
 
+from stream_events import CONVERSE_EVENTS, INVOKE_EVENTS
+
 from bedrockhelper.utils import (
 	DEFAULT_TEMPERATURE,
-	_decode_bedrock_chunk_bytes,
-	_iter_stream_with_callback,
 	build_converse_request,
 	extract_converse_text,
 	format_context_passages,
 	is_sampling_param_error,
-	iter_bedrock_stream_text,
-	iter_bedrock_stream_text_gen_with_tail,
+	iter_stream_text,
 	normalize_headers,
 	normalize_records,
 	normalize_s3_bucket_name,
@@ -20,164 +19,6 @@ from bedrockhelper.utils import (
 	supports_sampling_params,
 	truncate_by_chars,
 )
-
-
-class TestIterBedrockStreamText(TestCase):
-	def test_invoke_stream_yields_text(self):
-		events = [
-			{'chunk': {'bytes': json.dumps({'delta': {'text': 'hello'}}).encode('utf-8')}},
-			{'chunk': {'bytes': json.dumps({'delta': {'text': ' world'}, 'type': 'end'}).encode('utf-8')}},
-		]
-		texts = []
-		iter_bedrock_stream_text(events, on_text=texts.append, stream_kind='invoke')
-		self.assertEqual(texts, ['hello', ' world'])
-
-	def test_invoke_stream_stops_on_stop_type(self):
-		events = [
-			{'chunk': {'bytes': json.dumps({'delta': {'text': 'a'}}).encode('utf-8')}},
-			{'chunk': {'bytes': json.dumps({'type': 'message_stop'}).encode('utf-8')}},
-			{'chunk': {'bytes': json.dumps({'delta': {'text': 'ignored'}}).encode('utf-8')}},
-		]
-		texts = []
-		iter_bedrock_stream_text(events, on_text=texts.append, stream_kind='invoke')
-		self.assertEqual(texts, ['a'])
-
-	def test_invoke_stream_custom_stop_types(self):
-		events = [
-			{'chunk': {'bytes': json.dumps({'delta': {'text': 'a'}}).encode('utf-8')}},
-			{'chunk': {'bytes': json.dumps({'type': 'custom_stop'}).encode('utf-8')}},
-			{'chunk': {'bytes': json.dumps({'delta': {'text': 'ignored'}}).encode('utf-8')}},
-		]
-		texts = []
-		iter_bedrock_stream_text(events, on_text=texts.append, stream_kind='invoke', invoke_stop_types=('custom_stop',))
-		self.assertEqual(texts, ['a'])
-
-	def test_invoke_stream_skips_empty_chunk(self):
-		events = [
-			{'chunk': {}},
-			{'chunk': {'bytes': json.dumps({'delta': {'text': 'ok'}}).encode('utf-8')}},
-		]
-		texts = []
-		iter_bedrock_stream_text(events, on_text=texts.append, stream_kind='invoke')
-		self.assertEqual(texts, ['ok'])
-
-	def test_invoke_stream_skips_invalid_json(self):
-		events = [
-			{'chunk': {'bytes': b'invalid-json'}},
-			{'chunk': {'bytes': json.dumps({'delta': {'text': 'ok'}}).encode('utf-8')}},
-		]
-		texts = []
-		iter_bedrock_stream_text(events, on_text=texts.append, stream_kind='invoke')
-		self.assertEqual(texts, ['ok'])
-
-	def test_invoke_stream_skips_non_string_text(self):
-		events = [
-			{'chunk': {'bytes': json.dumps({'delta': {'text': 123}}).encode('utf-8')}},
-			{'chunk': {'bytes': json.dumps({'delta': {'text': 'ok'}}).encode('utf-8')}},
-		]
-		texts = []
-		iter_bedrock_stream_text(events, on_text=texts.append, stream_kind='invoke')
-		self.assertEqual(texts, ['ok'])
-
-	def test_invoke_stream_skips_empty_text(self):
-		events = [
-			{'chunk': {'bytes': json.dumps({'delta': {'text': ''}}).encode('utf-8')}},
-			{'chunk': {'bytes': json.dumps({'delta': {'text': 'ok'}}).encode('utf-8')}},
-		]
-		texts = []
-		iter_bedrock_stream_text(events, on_text=texts.append, stream_kind='invoke')
-		self.assertEqual(texts, ['ok'])
-
-	def test_converse_stream_yields_text(self):
-		events = [
-			{'contentBlockDelta': {'delta': {'text': 'hello'}}},
-			{'contentBlockDelta': {'delta': {'text': ' world'}}},
-			{'messageStop': {'stopReason': 'done'}},
-		]
-		texts = []
-		iter_bedrock_stream_text(events, on_text=texts.append, stream_kind='converse')
-		self.assertEqual(texts, ['hello', ' world'])
-
-	def test_converse_stream_snake_case(self):
-		events = [
-			{'content_block_delta': {'delta': {'text': 'snake'}}},
-			{'message_stop': {'stopReason': 'done'}},
-		]
-		texts = []
-		iter_bedrock_stream_text(events, on_text=texts.append, stream_kind='converse')
-		self.assertEqual(texts, ['snake'])
-
-	def test_converse_stream_stops_on_message_stop(self):
-		events = [
-			{'contentBlockDelta': {'delta': {'text': 'a'}}},
-			{'messageStop': {'stopReason': 'end_turn'}},
-			{'contentBlockDelta': {'delta': {'text': 'ignored'}}},
-		]
-		texts = []
-		iter_bedrock_stream_text(events, on_text=texts.append, stream_kind='converse')
-		self.assertEqual(texts, ['a'])
-
-	def test_converse_stream_stops_on_custom_key(self):
-		events = [
-			{'contentBlockDelta': {'delta': {'text': 'a'}}},
-			{'stop': True},
-			{'contentBlockDelta': {'delta': {'text': 'ignored'}}},
-		]
-		texts = []
-		iter_bedrock_stream_text(events, on_text=texts.append, stream_kind='converse', converse_stop_keys=('stop',))
-		self.assertEqual(texts, ['a'])
-
-	def test_converse_stream_skips_non_dict_delta(self):
-		events = [
-			{'contentBlockDelta': 'not-a-dict'},
-			{'contentBlockDelta': {'delta': {'text': 'ok'}}},
-		]
-		texts = []
-		iter_bedrock_stream_text(events, on_text=texts.append, stream_kind='converse')
-		self.assertEqual(texts, ['ok'])
-
-	def test_auto_mode_prefers_converse(self):
-		events = [
-			{'contentBlockDelta': {'delta': {'text': 'converse'}}},
-			{'messageStop': {}},
-		]
-		texts = []
-		iter_bedrock_stream_text(events, on_text=texts.append, stream_kind='auto')
-		self.assertEqual(texts, ['converse'])
-
-	def test_auto_mode_falls_back_to_invoke(self):
-		events = [
-			{'chunk': {'bytes': json.dumps({'delta': {'text': 'invoke'}}).encode('utf-8')}},
-		]
-		texts = []
-		iter_bedrock_stream_text(events, on_text=texts.append, stream_kind='auto')
-		self.assertEqual(texts, ['invoke'])
-
-	def test_auto_mode_skips_unrecognized(self):
-		events = [
-			{'unknown': 'event'},
-			{'chunk': {'bytes': json.dumps({'delta': {'text': 'ok'}}).encode('utf-8')}},
-		]
-		texts = []
-		iter_bedrock_stream_text(events, on_text=texts.append, stream_kind='auto')
-		self.assertEqual(texts, ['ok'])
-
-	def test_auto_mode_detects_converse_from_stop_key(self):
-		events = [
-			{'end': True},
-		]
-		texts = []
-		iter_bedrock_stream_text(events, on_text=texts.append, stream_kind='auto')
-		self.assertEqual(texts, [])
-
-	def test_skips_non_dict_events(self):
-		events = [
-			'not-a-dict',
-			{'chunk': {'bytes': json.dumps({'delta': {'text': 'ok'}}).encode('utf-8')}},
-		]
-		texts = []
-		iter_bedrock_stream_text(events, on_text=texts.append, stream_kind='invoke')
-		self.assertEqual(texts, ['ok'])
 
 
 class TestNormalizeHeaders(TestCase):
@@ -310,7 +151,7 @@ class TestExtractConverseText(TestCase):
 		result = extract_converse_text(resp)
 		self.assertEqual(result, 'ok')
 
-	def test_exception_returns_empty(self):
+	def test_non_dict_output_returns_empty(self):
 		resp = {'output': 'not-a-dict'}
 		result = extract_converse_text(resp)
 		self.assertEqual(result, '')
@@ -549,272 +390,38 @@ class TestNormalizeS3BucketName(TestCase):
 		self.assertEqual(result, 'my-bucket')
 
 
-class TestIterStreamWithCallback(TestCase):
-	def test_yields_text(self):
-		events = [
-			{'chunk': {'bytes': json.dumps({'delta': {'text': 'hello'}}).encode('utf-8')}},
-			{'chunk': {'bytes': json.dumps({'delta': {'text': ' world'}, 'type': 'end'}).encode('utf-8')}},
-		]
-		result = list(_iter_stream_with_callback(events, stream_kind='invoke'))
-		self.assertEqual(result, ['hello', ' world'])
-
-	def test_closes_stream(self):
-		class MockStream:
-			def __init__(self):
-				self.closed = False
-
-			def __iter__(self):
-				yield {'chunk': {'bytes': json.dumps({'delta': {'text': 'hi'}, 'type': 'end'}).encode('utf-8')}}
-
-			def close(self):
-				self.closed = True
-
-		stream = MockStream()
-		list(_iter_stream_with_callback(stream, stream_kind='invoke'))
-		self.assertTrue(stream.closed)
-
-	def test_propagates_exception(self):
-		def bad_stream():
-			yield {'chunk': {'bytes': json.dumps({'delta': {'text': 'ok'}}).encode('utf-8')}}
-			raise RuntimeError('stream error')
-
-		gen = _iter_stream_with_callback(bad_stream(), stream_kind='invoke')
-		self.assertEqual(next(gen), 'ok')
-
-		with self.assertRaises(RuntimeError) as ctx:
-			list(gen)
-		self.assertEqual(str(ctx.exception), 'stream error')
-
-	def test_no_close_method(self):
-		events = [
-			{'chunk': {'bytes': json.dumps({'delta': {'text': 'hi'}, 'type': 'end'}).encode('utf-8')}},
-		]
-		result = list(_iter_stream_with_callback(events, stream_kind='invoke'))
-		self.assertEqual(result, ['hi'])
-
-
-class TestIterBedrockStreamTextGenWithTail(TestCase):
-	def test_invoke_yields_text_and_captures_usage(self):
-		events = [
-			{'chunk': {'bytes': json.dumps({'delta': {'text': 'hello'}}).encode('utf-8')}},
-			{'chunk': {'bytes': json.dumps({'usage': {'inputTokens': 10}, 'type': 'end'}).encode('utf-8')}},
-		]
+class TestIterStreamText(TestCase):
+	def test_converse_yields_text_and_reports_metadata_after_message_stop(self):
 		captured = []
-		result = list(iter_bedrock_stream_text_gen_with_tail(events, on_tail=captured.append))
-		self.assertEqual(result, ['hello'])
-		self.assertTrue(any('usage' in c for c in captured))
+		texts = list(iter_stream_text(iter(CONVERSE_EVENTS), on_metrics=captured.append))
 
-	def test_converse_yields_text(self):
-		events = [
-			{'contentBlockDelta': {'delta': {'text': 'conv'}}},
-			{'messageStop': {'stopReason': 'done'}},
-		]
+		self.assertEqual(texts, ['Hello', ' world'])
+		self.assertEqual(captured, [CONVERSE_EVENTS[-1]['metadata']])
+
+	def test_invoke_yields_text_and_reports_invocation_metrics(self):
 		captured = []
-		result = list(iter_bedrock_stream_text_gen_with_tail(events, on_tail=captured.append))
-		self.assertEqual(result, ['conv'])
+		texts = list(iter_stream_text(iter(INVOKE_EVENTS), on_metrics=captured.append))
 
-	def test_captures_invocation_metrics(self):
-		events = [
-			{
-				'chunk': {
-					'bytes': json.dumps(
-						{'delta': {'text': 'hi'}, 'amazon-bedrock-invocationMetrics': {'latency': 123}}
-					).encode('utf-8')
+		self.assertEqual(texts, ['Hello', ' world'])
+		self.assertEqual(
+			captured,
+			[
+				{
+					'amazon-bedrock-invocationMetrics': {
+						'inputTokenCount': 12,
+						'outputTokenCount': 3,
+						'invocationLatency': 321,
+						'firstByteLatency': 45,
+					}
 				}
-			},
-			{'chunk': {'bytes': json.dumps({'type': 'end'}).encode('utf-8')}},
-		]
-		captured = []
-		list(iter_bedrock_stream_text_gen_with_tail(events, on_tail=captured.append))
-		self.assertTrue(any('amazon-bedrock-invocationMetrics' in c for c in captured))
-
-	def test_captures_invocation_metrics_alt_key(self):
-		events = [
-			{
-				'chunk': {
-					'bytes': json.dumps({'delta': {'text': 'x'}, 'invocationMetrics': {'tokens': 5}}).encode('utf-8')
-				}
-			},
-			{'chunk': {'bytes': json.dumps({'type': 'end'}).encode('utf-8')}},
-		]
-		captured = []
-		list(iter_bedrock_stream_text_gen_with_tail(events, on_tail=captured.append))
-		self.assertTrue(any('invocationMetrics' in c for c in captured))
-
-	def test_stops_on_message_stop(self):
-		events = [
-			{'chunk': {'bytes': json.dumps({'delta': {'text': 'a'}}).encode('utf-8')}},
-			{'chunk': {'bytes': json.dumps({'delta': {'text': 'b'}, 'type': 'message_stop'}).encode('utf-8')}},
-			{'chunk': {'bytes': json.dumps({'delta': {'text': 'ignored'}}).encode('utf-8')}},
-		]
-		result = list(iter_bedrock_stream_text_gen_with_tail(events, on_tail=lambda x: None))
-		self.assertEqual(result, ['a', 'b'])
-
-	def test_stops_on_messageStop(self):
-		events = [
-			{'chunk': {'bytes': json.dumps({'delta': {'text': 'a'}, 'type': 'messageStop'}).encode('utf-8')}},
-			{'chunk': {'bytes': json.dumps({'delta': {'text': 'ignored'}}).encode('utf-8')}},
-		]
-		result = list(iter_bedrock_stream_text_gen_with_tail(events, on_tail=lambda x: None))
-		self.assertEqual(result, ['a'])
-
-	def test_stops_on_end_turn(self):
-		events = [
-			{'chunk': {'bytes': json.dumps({'delta': {'text': 'a'}, 'type': 'end_turn'}).encode('utf-8')}},
-		]
-		result = list(iter_bedrock_stream_text_gen_with_tail(events, on_tail=lambda x: None))
-		self.assertEqual(result, ['a'])
-
-	def test_converse_snake_case(self):
-		events = [
-			{'content_block_delta': {'delta': {'text': 'snake'}}},
-			{'message_stop': {'stopReason': 'done'}},
-		]
-		captured = []
-		result = list(iter_bedrock_stream_text_gen_with_tail(events, on_tail=captured.append))
-		self.assertEqual(result, ['snake'])
-
-	def test_converse_stops_on_message_stop(self):
-		events = [
-			{'contentBlockDelta': {'delta': {'text': 'a'}}},
-			{'messageStop': {}},
-			{'contentBlockDelta': {'delta': {'text': 'ignored'}}},
-		]
-		result = list(iter_bedrock_stream_text_gen_with_tail(events, on_tail=lambda x: None))
-		self.assertEqual(result, ['a'])
-
-	def test_skips_non_dict_events(self):
-		events = [
-			'not-a-dict',
-			{'chunk': {'bytes': json.dumps({'delta': {'text': 'ok'}, 'type': 'end'}).encode('utf-8')}},
-		]
-		result = list(iter_bedrock_stream_text_gen_with_tail(events, on_tail=lambda x: None))
-		self.assertEqual(result, ['ok'])
-
-	def test_handles_invalid_json(self):
-		events = [
-			{'chunk': {'bytes': b'not-json'}},
-			{'chunk': {'bytes': json.dumps({'delta': {'text': 'valid'}, 'type': 'end'}).encode('utf-8')}},
-		]
-		result = list(iter_bedrock_stream_text_gen_with_tail(events, on_tail=lambda x: None))
-		self.assertEqual(result, ['valid'])
-
-	def test_handles_empty_chunk(self):
-		events = [
-			{'chunk': {}},
-			{'chunk': {'bytes': json.dumps({'delta': {'text': 'ok'}, 'type': 'end'}).encode('utf-8')}},
-		]
-		result = list(iter_bedrock_stream_text_gen_with_tail(events, on_tail=lambda x: None))
-		self.assertEqual(result, ['ok'])
-
-	def test_captures_message_stop_in_tail(self):
-		events = [
-			{'messageStop': {'stopReason': 'end_turn'}},
-		]
-		captured = []
-		list(iter_bedrock_stream_text_gen_with_tail(events, on_tail=captured.append))
-		self.assertTrue(any('messageStop' in c for c in captured))
-
-	def test_skips_non_dict_tail(self):
-		events = [
-			{'chunk': {'bytes': json.dumps('not-a-dict').encode('utf-8')}},
-		]
-		captured = []
-		list(iter_bedrock_stream_text_gen_with_tail(events, on_tail=captured.append))
-		self.assertEqual(len(captured), 0)
-
-
-class TestDecodeBedrockChunkBytes(TestCase):
-	def test_none_returns_none(self):
-		self.assertIsNone(_decode_bedrock_chunk_bytes(None))
-
-	def test_bytes_decoded(self):
-		result = _decode_bedrock_chunk_bytes(b'hello world')
-		self.assertEqual(result, 'hello world')
-
-	def test_bytearray_decoded(self):
-		result = _decode_bedrock_chunk_bytes(bytearray(b'hello'))
-		self.assertEqual(result, 'hello')
-
-	def test_string_returned_as_is(self):
-		result = _decode_bedrock_chunk_bytes('{"text": "hello"}')
-		self.assertEqual(result, '{"text": "hello"}')
-
-	def test_bytes_literal_string_single_quotes(self):
-		# String that looks like b'...'
-		result = _decode_bedrock_chunk_bytes("b'hello'")
-		self.assertEqual(result, 'hello')
-
-	def test_bytes_literal_string_double_quotes(self):
-		# String that looks like b"..."
-		result = _decode_bedrock_chunk_bytes('b"hello"')
-		self.assertEqual(result, 'hello')
-
-	def test_malformed_bytes_literal_returns_as_string(self):
-		# Malformed bytes literal (doesn't end with quote) - treated as regular string
-		result = _decode_bedrock_chunk_bytes("b'invalid")
-		self.assertEqual(result, "b'invalid")
-
-	def test_invalid_bytes_literal_eval_returns_none(self):
-		# Looks like bytes literal but ast.literal_eval fails (lines 271-272)
-		result = _decode_bedrock_chunk_bytes("b'\\x'")  # Invalid escape sequence
-		self.assertIsNone(result)
-
-	def test_unsupported_type_returns_none(self):
-		result = _decode_bedrock_chunk_bytes(12345)
-		self.assertIsNone(result)
-
-	def test_bytes_literal_eval_non_bytes_returns_none(self):
-		# ast.literal_eval returns something that's not bytes
-		result = _decode_bedrock_chunk_bytes("b'\\x80\\x81'")  # Valid bytes literal
-		self.assertIsNotNone(result)
-
-
-class TestIterBedrockStreamTextEdgeCases(TestCase):
-	def test_invoke_non_dict_json_skipped(self):
-		# JSON parses to non-dict (line 45 in utils.py)
-		events = [
-			{'chunk': {'bytes': json.dumps(['array', 'not', 'dict']).encode('utf-8')}},
-			{'chunk': {'bytes': json.dumps({'delta': {'text': 'ok'}}).encode('utf-8')}},
-		]
-		texts = []
-		iter_bedrock_stream_text(events, on_text=texts.append, stream_kind='invoke')
-		self.assertEqual(texts, ['ok'])
-
-	def test_invoke_chunk_with_none_bytes_skipped(self):
-		# chunk exists but bytes is None (line 38 in utils.py)
-		events = [
-			{'chunk': {'bytes': None}},
-			{'chunk': {'bytes': json.dumps({'delta': {'text': 'ok'}}).encode('utf-8')}},
-		]
-		texts = []
-		iter_bedrock_stream_text(events, on_text=texts.append, stream_kind='invoke')
-		self.assertEqual(texts, ['ok'])
-
-	def test_converse_message_stop_dict_stops(self):
-		# messageStop is a dict (line 72 in utils.py)
-		events = [
-			{'contentBlockDelta': {'delta': {'text': 'hello'}}},
-			{'message_stop': {'stopReason': 'end_turn'}},
-			{'contentBlockDelta': {'delta': {'text': 'ignored'}}},
-		]
-		texts = []
-		iter_bedrock_stream_text(events, on_text=texts.append, stream_kind='converse')
-		self.assertEqual(texts, ['hello'])
-
-	def test_converse_message_stop_dict_without_stop_key(self):
-		# messageStop dict stops via line 72 when not in converse_stop_keys
-		events = [
-			{'contentBlockDelta': {'delta': {'text': 'hello'}}},
-			{'messageStop': {'stopReason': 'end_turn'}},
-			{'contentBlockDelta': {'delta': {'text': 'ignored'}}},
-		]
-		texts = []
-		# Use custom stop keys that don't include messageStop
-		iter_bedrock_stream_text(
-			events,
-			on_text=texts.append,
-			stream_kind='converse',
-			converse_stop_keys=('custom_stop',),
+			],
 		)
-		self.assertEqual(texts, ['hello'])
+
+	def test_reads_events_after_message_stop(self):
+		events = [*CONVERSE_EVENTS[:5], {'contentBlockDelta': {'delta': {'text': 'late'}}}, CONVERSE_EVENTS[5]]
+		texts = list(iter_stream_text(iter(events), on_metrics=lambda m: None))
+		self.assertEqual(texts, ['Hello', ' world', 'late'])
+
+	def test_malformed_chunk_raises(self):
+		with self.assertRaises(json.JSONDecodeError):
+			list(iter_stream_text(iter([{'chunk': {'bytes': b'not json'}}]), on_metrics=lambda m: None))

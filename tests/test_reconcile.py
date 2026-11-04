@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import Mock, patch
 
+from bedrockhelper import BatchJobResponse, InMemoryJobStore
 from bedrockhelper.batch.reconcile import (
 	reconcile_batch_embedding_jobs,
 	state_from_bedrock_status,
@@ -181,3 +182,32 @@ class TestReconcileBatchEmbeddingJobs(TestCase):
 			# Ensure no processing or finalization happened
 			process_embeddings.assert_not_called()
 			store.mark_processed.assert_not_called()
+
+
+class TestReconcileWithInMemoryStore(TestCase):
+	def test_completed_job_with_no_embeddings_is_not_retried(self):
+		store = InMemoryJobStore()
+		store.add(
+			BatchJobResponse(
+				job_id='job-1',
+				job_name='name',
+				model_id='amazon.titan-embed-text-v2:0',
+				input_s3_uri='s3://bucket/in.jsonl',
+				output_s3_uri='s3://bucket/out/',
+			)
+		)
+		helper = Mock()
+		helper.get_batch_job.return_value = {'status': 'Completed'}
+		helper.parse_batch_embeddings.return_value = {}
+		process_embeddings = Mock()
+
+		first = reconcile_batch_embedding_jobs(helper=helper, store=store, process_embeddings=process_embeddings)
+		second = reconcile_batch_embedding_jobs(helper=helper, store=store, process_embeddings=process_embeddings)
+
+		self.assertEqual(first, (0, 1, 0))
+		self.assertEqual(second, (0, 0, 0))
+		self.assertEqual(helper.get_batch_job.call_count, 1)
+		stored = store.get('job-1')
+		self.assertEqual(stored.state, 'FAILED')
+		self.assertIn('parsed 0 embeddings', stored.last_error)
+		process_embeddings.assert_not_called()

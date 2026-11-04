@@ -1,5 +1,5 @@
 from dataclasses import FrozenInstanceError
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from unittest import TestCase
 
 from bedrockhelper import BatchJobResponse
@@ -18,7 +18,7 @@ class TestStoredBatchJob(TestCase):
 		)
 
 	def test_defaults_and_fields(self):
-		now = datetime.now(timezone.utc)
+		now = datetime.now(UTC)
 		sb = StoredBatchJob(job=self.job_obj, state='SUBMITTED', created_at=now)
 
 		self.assertIs(sb.job, self.job_obj)
@@ -33,22 +33,22 @@ class TestStoredBatchJob(TestCase):
 		self.assertIsNone(sb.embeddings_count)
 
 	def test_frozen_dataclass_prevents_attribute_assignment(self):
-		sb = StoredBatchJob(job=self.job_obj, state='SUBMITTED', created_at=datetime.now(timezone.utc))
+		sb = StoredBatchJob(job=self.job_obj, state='SUBMITTED', created_at=datetime.now(UTC))
 		with self.assertRaises(FrozenInstanceError):
 			sb.state = 'RUNNING'
 
 	def test_slots_prevents_instance_dict(self):
-		sb = StoredBatchJob(job=self.job_obj, state='SUBMITTED', created_at=datetime.now(timezone.utc))
+		sb = StoredBatchJob(job=self.job_obj, state='SUBMITTED', created_at=datetime.now(UTC))
 		self.assertFalse(hasattr(sb, '__dict__'))
 
 	def test_equality(self):
-		now = datetime.now(timezone.utc)
+		now = datetime.now(UTC)
 		sb1 = StoredBatchJob(job=self.job_obj, state='SUBMITTED', created_at=now)
 		sb2 = StoredBatchJob(job=self.job_obj, state='SUBMITTED', created_at=now)
 		self.assertEqual(sb1, sb2)
 
 	def test_not_hashable(self):
-		now = datetime.now(timezone.utc)
+		now = datetime.now(UTC)
 		sb = StoredBatchJob(job=self.job_obj, state='SUBMITTED', created_at=now)
 
 		with self.assertRaises(TypeError):

@@ -154,7 +154,7 @@ version = "1.43.114"
 description = "Type annotations for boto3 1.43.114 generated with mypy-boto3-builder 8.12.0"
 optional = false
 python-versions = ">=3.9"
-groups = ["main"]
+groups = ["dev"]
 files = [
     {file = "boto3_stubs-1.43.114-py3-none-any.whl", hash = "sha256:2a9effc8ea19b5edf95b83e01c033e12c92c293c3a193268eeb7830cc4c10ddb"},
     {file = "boto3_stubs-1.43.114.tar.gz", hash = "sha256:98729a4aa168a23e27cb68490979987cf7e4872df48c7480fd4399679c9dcbf8"},
@@ -634,7 +634,7 @@ version = "1.43.113"
 description = "Type annotations and code completion for botocore"
 optional = false
 python-versions = ">=3.10"
-groups = ["main"]
+groups = ["dev"]
 files = [
     {file = "botocore_stubs-1.43.113-py3-none-any.whl", hash = "sha256:716fdf4650fbcca50ec5086882d749f9d0f68047370830d9203a2de297c5515f"},
     {file = "botocore_stubs-1.43.113.tar.gz", hash = "sha256:49deda166eceee64243cca0b5dc9de5ce005949dee9ead477f8df22bafaee374"},
@@ -1429,7 +1429,7 @@ version = "0.19.2"
 description = "Type annotations and code completion for s3transfer"
 optional = false
 python-versions = ">=3.10"
-groups = ["main"]
+groups = ["dev"]
 files = [
     {file = "types_s3transfer-0.19.2-py3-none-any.whl", hash = "sha256:f1167b9a082a49fc55f12700dcbd3a8b540b9e6fec4e1d782ff44f3eef0bdbff"},
     {file = "types_s3transfer-0.19.2.tar.gz", hash = "sha256:2a78a806c09b11fc6d59756402ade26b49b93a85ac6f209a39e2498211c6a41b"},
@@ -1441,12 +1441,11 @@ version = "4.16.0"
 description = "Backported and Experimental Type Hints for Python 3.9+"
 optional = false
 python-versions = ">=3.9"
-groups = ["main", "dev"]
+groups = ["dev"]
 files = [
     {file = "typing_extensions-4.16.0-py3-none-any.whl", hash = "sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8"},
     {file = "typing_extensions-4.16.0.tar.gz", hash = "sha256:dc983d19a509c94dba722ee6abd33940f7c05a89e243c47e907eb4db6f1a43e5"},
 ]
-markers = {main = "python_version == \"3.11\""}
 
 [[package]]
 name = "urllib3"
@@ -1488,4 +1487,4 @@ python-discovery = ">=1.6.1"
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.11,<4.0"
-content-hash = "5ec6a6ff8f822258471aa4dda3b7ba2bd8d150e7ccbf01b11a0b3dd933867e52"
+content-hash = "b2c1dceca6005116c226f16ec73c30264f4020d927d98d05b4f6e96c7e960a99"

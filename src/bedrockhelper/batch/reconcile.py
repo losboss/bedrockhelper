@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Callable, Dict, List, Tuple
+from datetime import datetime, UTC
+from typing import TYPE_CHECKING
+from collections.abc import Callable
 
 from .store import JobStore
 from .models import BatchJobRef
@@ -10,7 +11,7 @@ from bedrockhelper.models import BatchJobResponse
 if TYPE_CHECKING:
 	from bedrockhelper.main import BedrockHelper
 
-ProcessEmbeddingsFn = Callable[[BatchJobRef, Dict[str, List[float]]], None]
+ProcessEmbeddingsFn = Callable[[BatchJobRef, dict[str, list[float]]], None]
 
 
 def state_from_bedrock_status(status: str) -> str:
@@ -23,17 +24,17 @@ def state_from_bedrock_status(status: str) -> str:
 
 def reconcile_batch_embedding_jobs(
 	*,
-	helper: 'BedrockHelper',
+	helper: BedrockHelper,
 	store: JobStore,
 	process_embeddings: ProcessEmbeddingsFn,
 	limit: int = 25,
-) -> Tuple[int, int, int]:
+) -> tuple[int, int, int]:
 	"""
 	Poll and reconcile unfinished batch embedding jobs.
 
 	Returns (processed, failed, skipped).
 	"""
-	now = datetime.now(timezone.utc)
+	now = datetime.now(UTC)
 	processed = 0
 	failed = 0
 	skipped = 0
@@ -62,9 +63,10 @@ def reconcile_batch_embedding_jobs(
 			if BatchJobResponse.is_success(info):
 				embeddings = helper.parse_batch_embeddings(output_s3_uri=job.output_s3_uri)
 				if not embeddings:
+					# Terminal: the output will not change, so retrying on every run achieves nothing.
 					store.mark_checked(
 						job.job_id,
-						state=state_from_bedrock_status(bedrock_status),
+						state='FAILED',
 						last_checked_at=now,
 						attempts=attempts,
 						last_error='Completed but parsed 0 embeddings from output',

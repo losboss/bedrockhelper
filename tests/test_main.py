@@ -1,184 +1,60 @@
+import asyncio
 import json
 import os
-from datetime import datetime, timedelta, timezone
-from unittest import TestCase
+import threading
+from datetime import datetime, timedelta, UTC
+from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import Mock, patch
 
 from botocore.config import Config
 from botocore.exceptions import ClientError
+from stream_events import CONVERSE_EVENTS, INVOKE_EVENTS
 
-from bedrockhelper.main import (
-	BedrockHelper,
-	_BotoSessionManager,
-	_is_expired_token,
-	_make_on_tail,
-)
+from bedrockhelper.main import BedrockHelper
+from bedrockhelper.session import BotoSessionManager, is_expired_token, is_session_of_role
 from bedrockhelper.models import (
 	BatchJobResponse,
 	EmbeddingResponse,
-	RAGStream,
 )
 
 
 class TestIsExpiredToken(TestCase):
 	def test_expired_token_error(self):
 		err = ClientError({'Error': {'Code': 'ExpiredToken'}}, 'test')
-		self.assertTrue(_is_expired_token(err))
+		self.assertTrue(is_expired_token(err))
 
 	def test_expired_token_exception(self):
 		err = ClientError({'Error': {'Code': 'ExpiredTokenException'}}, 'test')
-		self.assertTrue(_is_expired_token(err))
+		self.assertTrue(is_expired_token(err))
 
 	def test_invalid_client_token_id(self):
 		err = ClientError({'Error': {'Code': 'InvalidClientTokenId'}}, 'test')
-		self.assertTrue(_is_expired_token(err))
+		self.assertTrue(is_expired_token(err))
 
 	def test_unrecognized_client_exception(self):
 		err = ClientError({'Error': {'Code': 'UnrecognizedClientException'}}, 'test')
-		self.assertTrue(_is_expired_token(err))
+		self.assertTrue(is_expired_token(err))
 
 	def test_request_expired(self):
 		err = ClientError({'Error': {'Code': 'RequestExpired'}}, 'test')
-		self.assertTrue(_is_expired_token(err))
+		self.assertTrue(is_expired_token(err))
 
 	def test_other_client_error(self):
 		err = ClientError({'Error': {'Code': 'AccessDenied'}}, 'test')
-		self.assertFalse(_is_expired_token(err))
+		self.assertFalse(is_expired_token(err))
 
 	def test_non_client_error(self):
 		err = ValueError('test')
-		self.assertFalse(_is_expired_token(err))
-
-
-class TestMakeOnTail(TestCase):
-	def test_no_stream_in_ref(self):
-		stream_ref = {}
-		on_tail = _make_on_tail(stream_ref)
-		on_tail({'amazon-bedrock-invocationMetrics': {'inputTokenCount': 10}})
-
-	# Should not raise
-
-	def test_ignores_non_dict_message(self):
-		mock_stream = Mock(spec=RAGStream)
-		stream_ref = {'stream': mock_stream}
-		on_tail = _make_on_tail(stream_ref)
-
-		on_tail('nope')  # type: ignore[arg-type]
-		mock_stream._set_tail_body.assert_not_called()
-
-	def test_sets_initial_tail_body_when_prev_missing(self):
-		mock_stream = Mock(spec=RAGStream)
-		# Ensure getattr(..., "_tail_body", None) returns None
-		if hasattr(mock_stream, '_tail_body'):
-			delattr(mock_stream, '_tail_body')
-
-		stream_ref = {'stream': mock_stream}
-		on_tail = _make_on_tail(stream_ref)
-
-		msg = {'amazon-bedrock-invocationMetrics': {'inputTokenCount': 10}}
-		on_tail(msg)
-		mock_stream._set_tail_body.assert_called_once_with(msg)
-
-	def test_sets_initial_tail_body_when_prev_not_dict(self):
-		mock_stream = Mock(spec=RAGStream)
-		mock_stream._tail_body = 'not a dict'
-		stream_ref = {'stream': mock_stream}
-		on_tail = _make_on_tail(stream_ref)
-
-		msg = {'amazon-bedrock-invocationMetrics': {'inputTokenCount': 10}}
-		on_tail(msg)
-		mock_stream._set_tail_body.assert_called_once_with(msg)
-
-	def test_merges_invocation_metrics(self):
-		mock_stream = Mock(spec=RAGStream)
-		mock_stream._tail_body = {
-			'amazon-bedrock-invocationMetrics': {'inputTokenCount': 10, 'invocationLatency': 111},
-			'other': 'keep-me',
-		}
-		stream_ref = {'stream': mock_stream}
-		on_tail = _make_on_tail(stream_ref)
-
-		new_msg = {'amazon-bedrock-invocationMetrics': {'outputTokenCount': 5}}
-		on_tail(new_msg)
-
-		# Should merge with previous + keep non-metrics fields
-		expected = {
-			'amazon-bedrock-invocationMetrics': {
-				'inputTokenCount': 10,
-				'invocationLatency': 111,
-				'outputTokenCount': 5,
-			},
-			'other': 'keep-me',
-		}
-		mock_stream._set_tail_body.assert_called_once_with(expected)
-
-	def test_invocation_metrics_new_values_override_old(self):
-		mock_stream = Mock(spec=RAGStream)
-		mock_stream._tail_body = {'amazon-bedrock-invocationMetrics': {'inputTokenCount': 10, 'outputTokenCount': 1}}
-		stream_ref = {'stream': mock_stream}
-		on_tail = _make_on_tail(stream_ref)
-
-		new_msg = {'amazon-bedrock-invocationMetrics': {'outputTokenCount': 99}}
-		on_tail(new_msg)
-
-		expected = {'amazon-bedrock-invocationMetrics': {'inputTokenCount': 10, 'outputTokenCount': 99}}
-		mock_stream._set_tail_body.assert_called_once_with(expected)
-
-	def test_replaces_invocation_metrics_when_prev_missing(self):
-		mock_stream = Mock(spec=RAGStream)
-		mock_stream._tail_body = {'other': 'data'}
-		stream_ref = {'stream': mock_stream}
-		on_tail = _make_on_tail(stream_ref)
-
-		new_msg = {'amazon-bedrock-invocationMetrics': {'inputTokenCount': 10}}
-		on_tail(new_msg)
-
-		expected = {
-			'other': 'data',
-			'amazon-bedrock-invocationMetrics': {'inputTokenCount': 10},
-		}
-		mock_stream._set_tail_body.assert_called_once_with(expected)
-
-	def test_keeps_last_seen_type_and_stop_flags(self):
-		mock_stream = Mock(spec=RAGStream)
-		mock_stream._tail_body = {
-			'amazon-bedrock-invocationMetrics': {'inputTokenCount': 10},
-			'type': 'message_delta',
-		}
-		stream_ref = {'stream': mock_stream}
-		on_tail = _make_on_tail(stream_ref)
-
-		new_msg = {'type': 'message_stop', 'message_stop': True}
-		on_tail(new_msg)
-
-		expected = {
-			'amazon-bedrock-invocationMetrics': {'inputTokenCount': 10},
-			'type': 'message_stop',
-			'message_stop': True,
-		}
-		mock_stream._set_tail_body.assert_called_once_with(expected)
-
-	def test_does_not_add_stop_flags_when_not_present(self):
-		mock_stream = Mock(spec=RAGStream)
-		mock_stream._tail_body = {'amazon-bedrock-invocationMetrics': {'inputTokenCount': 10}}
-		stream_ref = {'stream': mock_stream}
-		on_tail = _make_on_tail(stream_ref)
-
-		on_tail({'other': 'new'})  # no flags, no invocationMetrics
-
-		expected = {
-			'amazon-bedrock-invocationMetrics': {'inputTokenCount': 10},
-		}
-		mock_stream._set_tail_body.assert_called_once_with(expected)
+		self.assertFalse(is_expired_token(err))
 
 
 class TestBotoSessionManager(TestCase):
-	@patch('bedrockhelper.main.boto3.Session')
+	@patch('bedrockhelper.session.boto3.Session')
 	def test_no_role_arn(self, mock_session_cls):
 		mock_session = Mock()
 		mock_session_cls.return_value = mock_session
 
-		mgr = _BotoSessionManager(
+		mgr = BotoSessionManager(
 			region_name='us-east-1',
 			botocore_config=Mock(),
 			role_arn=None,
@@ -188,9 +64,9 @@ class TestBotoSessionManager(TestCase):
 		self.assertEqual(sess, mock_session)
 		mock_session_cls.assert_called_once_with(region_name='us-east-1')
 
-	@patch('bedrockhelper.main.boto3.Session')
+	@patch('bedrockhelper.session.boto3.Session')
 	def test_invalidate(self, mock_session_cls):
-		mgr = _BotoSessionManager(
+		mgr = BotoSessionManager(
 			region_name='us-east-1',
 			botocore_config=Mock(),
 		)
@@ -202,14 +78,14 @@ class TestBotoSessionManager(TestCase):
 		self.assertIsNone(mgr._boto3_session)
 		self.assertEqual(mgr._clients, {})
 
-	@patch('bedrockhelper.main.boto3.Session')
+	@patch('bedrockhelper.session.boto3.Session')
 	def test_client_caching(self, mock_session_cls):
 		mock_session = Mock()
 		mock_client = Mock()
 		mock_session.client.return_value = mock_client
 		mock_session_cls.return_value = mock_session
 
-		mgr = _BotoSessionManager(
+		mgr = BotoSessionManager(
 			region_name='us-east-1',
 			botocore_config=Mock(),
 		)
@@ -220,8 +96,8 @@ class TestBotoSessionManager(TestCase):
 		self.assertIs(c1, c2)
 		mock_session.client.assert_called_once()
 
-	@patch.object(_BotoSessionManager, '_is_already_assumed_role', return_value=False)
-	@patch('bedrockhelper.main.AssumeRoleCredentialFetcher')
+	@patch.object(BotoSessionManager, '_is_already_assumed_role', return_value=False)
+	@patch('bedrockhelper.session.AssumeRoleCredentialFetcher')
 	@patch.dict(
 		os.environ,
 		{
@@ -239,7 +115,7 @@ class TestBotoSessionManager(TestCase):
 
 		def fetch_credentials():
 			fetches.append(None)
-			expiry = datetime.now(timezone.utc) + timedelta(seconds=30)
+			expiry = datetime.now(UTC) + timedelta(seconds=30)
 			return {
 				'access_key': f'ASSUMED{len(fetches)}',
 				'secret_key': 'secret',
@@ -249,7 +125,7 @@ class TestBotoSessionManager(TestCase):
 
 		mock_fetcher_cls.return_value.fetch_credentials = fetch_credentials
 
-		mgr = _BotoSessionManager(
+		mgr = BotoSessionManager(
 			region_name='us-east-1',
 			botocore_config=Config(),
 			role_arn='arn:aws:iam::123456789012:role/test',
@@ -261,6 +137,85 @@ class TestBotoSessionManager(TestCase):
 
 		self.assertTrue(first.startswith('ASSUMED'))
 		self.assertNotEqual(first, second)
+
+
+class TestIsSessionOfRole(TestCase):
+	def test_matches_session_of_the_role(self):
+		cases = [
+			('arn:aws:sts::123456789012:assumed-role/Reader/s1', 'arn:aws:iam::123456789012:role/Reader'),
+			('arn:aws:sts::123456789012:assumed-role/Reader/s1', 'arn:aws:iam::123456789012:role/team/a/Reader'),
+			('arn:aws-cn:sts::123456789012:assumed-role/Reader/s1', 'arn:aws-cn:iam::123456789012:role/Reader'),
+		]
+		for caller, role in cases:
+			with self.subTest(caller=caller, role=role):
+				self.assertTrue(is_session_of_role(caller, role))
+
+	def test_rejects_other_identities(self):
+		role = 'arn:aws:iam::123456789012:role/Reader'
+		cases = [
+			'arn:aws:sts::999999999999:assumed-role/Reader/s1',  # other account
+			'arn:aws:sts::123456789012:assumed-role/ReaderAdmin/s1',  # name shares a prefix
+			'arn:aws:sts::123456789012:assumed-role/Writer/s1',
+			'arn:aws-cn:sts::123456789012:assumed-role/Reader/s1',  # other partition
+			'arn:aws:iam::123456789012:user/Reader',
+			'arn:aws:sts::123456789012:federated-user/Reader',
+			'',
+			'not-an-arn',
+		]
+		for caller in cases:
+			with self.subTest(caller=caller):
+				self.assertFalse(is_session_of_role(caller, role))
+
+	def test_rejects_a_target_that_is_not_a_role(self):
+		caller = 'arn:aws:sts::123456789012:assumed-role/Reader/s1'
+		self.assertFalse(is_session_of_role(caller, 'arn:aws:iam::123456789012:user/Reader'))
+		self.assertFalse(is_session_of_role(caller, 'Reader'))
+
+
+class TestAlreadyAssumedRole(TestCase):
+	ROLE = 'arn:aws:iam::123456789012:role/Reader'
+
+	def _manager(self):
+		return BotoSessionManager(region_name='us-east-1', botocore_config=Config(), role_arn=self.ROLE)
+
+	@patch('bedrockhelper.session.boto3.Session')
+	def test_true_when_running_as_the_role(self, mock_session_cls):
+		sts = mock_session_cls.return_value.client.return_value
+		sts.get_caller_identity.return_value = {'Arn': 'arn:aws:sts::123456789012:assumed-role/Reader/pod'}
+		self.assertTrue(self._manager()._is_already_assumed_role(self.ROLE))
+
+	@patch('bedrockhelper.session.boto3.Session')
+	def test_false_when_running_as_another_identity(self, mock_session_cls):
+		sts = mock_session_cls.return_value.client.return_value
+		sts.get_caller_identity.return_value = {'Arn': 'arn:aws:iam::123456789012:user/deploy'}
+		self.assertFalse(self._manager()._is_already_assumed_role(self.ROLE))
+
+	@patch('bedrockhelper.session.boto3.Session')
+	def test_identity_lookup_failure_is_logged_and_assumes(self, mock_session_cls):
+		sts = mock_session_cls.return_value.client.return_value
+		sts.get_caller_identity.side_effect = ClientError(
+			{'Error': {'Code': 'AccessDenied', 'Message': 'no'}}, 'GetCallerIdentity'
+		)
+		with self.assertLogs('bedrockhelper.session', level='WARNING'):
+			self.assertFalse(self._manager()._is_already_assumed_role(self.ROLE))
+
+	@patch.object(BotoSessionManager, '_is_already_assumed_role', return_value=True)
+	@patch('bedrockhelper.session.AssumeRoleCredentialFetcher')
+	@patch.dict(
+		os.environ,
+		{
+			'AWS_ACCESS_KEY_ID': 'SOURCE',
+			'AWS_SECRET_ACCESS_KEY': 'SOURCE',
+			'AWS_CONFIG_FILE': os.devnull,
+			'AWS_SHARED_CREDENTIALS_FILE': os.devnull,
+		},
+		clear=True,
+	)
+	def test_does_not_assume_the_role_it_already_has(self, mock_fetcher_cls, _mock_already):
+		creds = self._manager()._ensure_session().get_credentials()
+
+		mock_fetcher_cls.assert_not_called()
+		self.assertEqual(creds.get_frozen_credentials().access_key, 'SOURCE')
 
 
 class TestBedrockHelperInit(TestCase):
@@ -288,6 +243,62 @@ class TestBedrockHelperInit(TestCase):
 			)
 			self.assertEqual(helper.rag_model_id, 'custom-rag')
 			self.assertEqual(helper.embedding_model_id, 'custom-embed')
+
+	def _helper(self, **kwargs):
+		return BedrockHelper(bedrock_runtime_client=Mock(), bedrock_client=Mock(), s3_client=Mock(), **kwargs)
+
+	def test_should_read_aws_environment_when_constructed_not_when_imported(self):
+		env = {
+			'AWS_REGION': 'eu-west-1',
+			'AWS_ROLE_ARN': 'arn:aws:iam::123456789012:role/Reader',
+			'AWS_ROLE_SESSION_NAME': 'worker',
+			'AWS_EXTERNAL_ID': 'ext-1',
+			'AWS_ASSUME_ROLE_DURATION': '900',
+		}
+		# bedrockhelper.main is already imported, so these are set after import.
+		with patch.dict(os.environ, env, clear=True):
+			mgr = self._helper()._session_mgr
+
+		self.assertEqual(
+			(mgr._region, mgr._role_arn, mgr._role_session_name, mgr._external_id, mgr._duration),
+			('eu-west-1', 'arn:aws:iam::123456789012:role/Reader', 'worker', 'ext-1', 900),
+		)
+
+	def test_should_use_built_in_defaults_when_environment_is_empty(self):
+		with patch.dict(os.environ, {}, clear=True):
+			mgr = self._helper()._session_mgr
+
+		self.assertEqual(
+			(mgr._region, mgr._role_arn, mgr._role_session_name, mgr._external_id, mgr._duration),
+			('ca-central-1', None, 'bedrockhelper', None, 3600),
+		)
+
+	def test_should_prefer_arguments_over_environment(self):
+		env = {'AWS_REGION': 'eu-west-1', 'AWS_ROLE_ARN': 'arn:aws:iam::123456789012:role/FromEnv'}
+		with patch.dict(os.environ, env, clear=True):
+			mgr = self._helper(
+				region_name='us-east-1',
+				role_arn='arn:aws:iam::123456789012:role/FromArg',
+				assume_role_duration_seconds=1200,
+			)._session_mgr
+
+		self.assertEqual(
+			(mgr._region, mgr._role_arn, mgr._duration),
+			('us-east-1', 'arn:aws:iam::123456789012:role/FromArg', 1200),
+		)
+
+	def test_should_assume_no_role_when_role_arn_is_explicitly_none(self):
+		env = {'AWS_ROLE_ARN': 'arn:aws:iam::123456789012:role/FromEnv', 'AWS_EXTERNAL_ID': 'ext-1'}
+		with patch.dict(os.environ, env, clear=True):
+			mgr = self._helper(role_arn=None, external_id=None)._session_mgr
+
+		self.assertIsNone(mgr._role_arn)
+		self.assertIsNone(mgr._external_id)
+
+	def test_should_name_the_variable_when_duration_is_not_a_number(self):
+		with patch.dict(os.environ, {'AWS_ASSUME_ROLE_DURATION': 'an hour'}, clear=True):
+			with self.assertRaisesRegex(ValueError, 'AWS_ASSUME_ROLE_DURATION'):
+				self._helper()
 
 	def test_invalid_max_concurrent_streams(self):
 		with self.assertRaises(ValueError):
@@ -426,6 +437,28 @@ class TestExtractMetricsFromResponse(TestCase):
 		self.assertIsNone(metrics.input_tokens)
 		self.assertIsNone(metrics.output_tokens)
 
+	def test_should_use_next_usage_key_when_first_is_not_a_number(self):
+		body = {'usage': {'inputTokens': 'n/a', 'input_tokens': 7}}
+
+		metrics = BedrockHelper._extract_metrics_from_response({}, body)
+
+		self.assertEqual(metrics.input_tokens, 7)
+
+	def test_should_keep_usage_counts_when_invocation_metrics_are_not_numbers(self):
+		body = {
+			'usage': {'inputTokens': 12, 'outputTokens': 3},
+			'amazon-bedrock-invocationMetrics': {'inputTokenCount': 'bad', 'outputTokenCount': None},
+		}
+
+		metrics = BedrockHelper._extract_metrics_from_response({}, body)
+
+		self.assertEqual((metrics.input_tokens, metrics.output_tokens), (12, 3))
+
+	def test_should_leave_latency_unset_when_latency_ms_is_not_a_number(self):
+		metrics = BedrockHelper._extract_metrics_from_response({}, {'metrics': {'latencyMs': 'soon'}})
+
+		self.assertIsNone(metrics.invocation_latency_ms)
+
 
 class TestGenerateWithRAG(TestCase):
 	def setUp(self):
@@ -453,20 +486,18 @@ class TestGenerateWithRAG(TestCase):
 		self.assertEqual(result.text, 'answer')
 		self.assertFalse(result.stream)
 
-	def test_converse_fallback_on_error(self):
-		self.mock_runtime.converse.side_effect = Exception('converse failed')
-		self.mock_runtime.invoke_model.return_value = {
-			'body': Mock(read=lambda: json.dumps({'content': [{'text': 'fallback answer'}]}).encode()),
-			'ResponseMetadata': {'HTTPHeaders': {}},
-		}
+	def test_converse_errors_are_raised_not_retried_through_invoke_model(self):
+		for code in ('AccessDeniedException', 'ThrottlingException', 'ValidationException'):
+			with self.subTest(code=code):
+				self.mock_runtime.reset_mock()
+				error = ClientError({'Error': {'Code': code, 'Message': 'no'}}, 'Converse')
+				self.mock_runtime.converse.side_effect = error
 
-		result = self.helper.generate_with_rag(
-			system_prompt='prompt',
-			context='context',
-			question='question',
-		)
+				with self.assertRaises(ClientError) as ctx:
+					self.helper.generate_with_rag(system_prompt='prompt', context='context', question='question')
 
-		self.assertEqual(result.text, 'fallback answer')
+				self.assertIs(ctx.exception, error)
+				self.mock_runtime.invoke_model.assert_not_called()
 
 	def test_context_as_list(self):
 		self.mock_runtime.converse.return_value = {
@@ -601,26 +632,35 @@ class TestGenerateWithRAG(TestCase):
 		self.assertNotIn('temperature', self.mock_runtime.converse.call_args_list[1][1]['inferenceConfig'])
 		self.mock_runtime.invoke_model.assert_not_called()
 
-	def test_retry_exhausted_falls_back_to_invoke_model(self):
+	def test_second_sampling_rejection_is_raised(self):
 		error = ClientError(
 			{'Error': {'Code': 'ValidationException', 'Message': 'temperature is not supported'}},
 			'Converse',
 		)
 		self.mock_runtime.converse.side_effect = error
-		self.mock_runtime.invoke_model.return_value = {
-			'body': Mock(read=lambda: json.dumps({'content': [{'text': 'fallback answer'}]}).encode()),
-			'ResponseMetadata': {'HTTPHeaders': {}},
+
+		with self.assertRaises(ClientError):
+			self.helper.generate_with_rag(
+				system_prompt='prompt',
+				context='context',
+				model_id='anthropic.claude-sonnet-4-5-20250929-v1:0',
+				temperature=0.5,
+			)
+
+		self.assertEqual(self.mock_runtime.converse.call_count, 2)
+		self.mock_runtime.invoke_model.assert_not_called()
+
+	def test_converse_latency_is_reported(self):
+		self.mock_runtime.converse.return_value = {
+			'output': {'message': {'content': [{'text': 'answer'}]}},
+			'usage': {'inputTokens': 12, 'outputTokens': 3, 'totalTokens': 15},
+			'metrics': {'latencyMs': 321},
 		}
 
-		result = self.helper.generate_with_rag(
-			system_prompt='prompt',
-			context='context',
-			model_id='anthropic.claude-sonnet-4-5-20250929-v1:0',
-			temperature=0.5,
-		)
+		metrics = self.helper.generate_with_rag(system_prompt='p', context='c').metrics
 
-		self.assertEqual(result.text, 'fallback answer')
-		self.assertEqual(self.mock_runtime.converse.call_count, 2)
+		self.assertEqual((metrics.input_tokens, metrics.output_tokens, metrics.total_tokens), (12, 3, 15))
+		self.assertEqual(metrics.invocation_latency_ms, 321)
 
 	def test_invoke_model_omits_temperature_for_incompatible_model(self):
 		self.mock_runtime.invoke_model.return_value = {
@@ -669,19 +709,17 @@ class TestGenerateWithRAG(TestCase):
 			{'Error': {'Code': 'ValidationException', 'Message': 'invalid model identifier'}},
 			'Converse',
 		)
-		self.mock_runtime.invoke_model.return_value = {
-			'body': Mock(read=lambda: json.dumps({'content': [{'text': 'fallback answer'}]}).encode()),
-			'ResponseMetadata': {'HTTPHeaders': {}},
-		}
 
-		self.helper.generate_with_rag(
-			system_prompt='prompt',
-			context='context',
-			model_id='anthropic.claude-sonnet-4-5-20250929-v1:0',
-			temperature=0.5,
-		)
+		with self.assertRaises(ClientError):
+			self.helper.generate_with_rag(
+				system_prompt='prompt',
+				context='context',
+				model_id='anthropic.claude-sonnet-4-5-20250929-v1:0',
+				temperature=0.5,
+			)
 
 		self.assertEqual(self.mock_runtime.converse.call_count, 1)
+		self.mock_runtime.invoke_model.assert_not_called()
 
 
 class TestExtractTextFromClaude(TestCase):
@@ -739,25 +777,50 @@ class TestStreamWithRAG(TestCase):
 		self.assertEqual(texts, ['hello'])
 		self.assertEqual(stream.result.text, 'hello')
 
-	def test_fallback_to_invoke_stream(self):
-		self.mock_runtime.converse_stream.side_effect = Exception('failed')
+	def test_converse_stream_error_is_raised_not_retried_through_invoke(self):
+		error = ClientError({'Error': {'Code': 'AccessDeniedException', 'Message': 'no'}}, 'ConverseStream')
+		self.mock_runtime.converse_stream.side_effect = error
 
-		mock_events = [
-			{'chunk': {'bytes': json.dumps({'delta': {'text': 'fallback'}}).encode()}},
-		]
-		self.mock_runtime.invoke_model_with_response_stream.return_value = {
-			'body': iter(mock_events),
-			'ResponseMetadata': {'HTTPHeaders': {}},
-		}
+		with self.assertRaises(ClientError) as ctx:
+			self.helper.stream_with_rag(system_prompt='prompt', context='context', question='question')
+
+		self.assertIs(ctx.exception, error)
+		self.mock_runtime.invoke_model_with_response_stream.assert_not_called()
+
+	def test_converse_stream_result_has_token_metrics(self):
+		self.mock_runtime.converse_stream.return_value = {'stream': iter(CONVERSE_EVENTS)}
+
+		stream = self.helper.stream_with_rag(system_prompt='prompt', context='context')
+		self.assertEqual(list(stream), ['Hello', ' world'])
+
+		metrics = stream.result.metrics
+		self.assertEqual(stream.result.text, 'Hello world')
+		self.assertEqual((metrics.input_tokens, metrics.output_tokens, metrics.total_tokens), (12, 3, 15))
+		self.assertEqual(metrics.invocation_latency_ms, 321)
+
+	def test_invoke_stream_result_has_token_metrics(self):
+		self.mock_runtime.invoke_model_with_response_stream.return_value = {'body': iter(INVOKE_EVENTS)}
 
 		stream = self.helper.stream_with_rag(
 			system_prompt='prompt',
 			context='context',
-			question='question',
+			model_id='anthropic.claude-sonnet-4-5-20250929-v1:0',
+			prefer_converse=False,
 		)
+		self.assertEqual(list(stream), ['Hello', ' world'])
 
-		texts = list(stream)
-		self.assertEqual(texts, ['fallback'])
+		metrics = stream.result.metrics
+		self.assertEqual((metrics.input_tokens, metrics.output_tokens, metrics.total_tokens), (12, 3, 15))
+		self.assertEqual((metrics.invocation_latency_ms, metrics.first_byte_latency_ms), (321, 45))
+
+	def test_stream_is_closed_when_finished(self):
+		event_stream = Mock()
+		event_stream.__iter__ = Mock(return_value=iter(CONVERSE_EVENTS))
+		self.mock_runtime.converse_stream.return_value = {'stream': event_stream}
+
+		list(self.helper.stream_with_rag(system_prompt='prompt', context='context'))
+
+		event_stream.close.assert_called_once()
 
 	def test_prefer_converse_false(self):
 		mock_events = [
@@ -901,6 +964,21 @@ class TestBatchEmbeddings(TestCase):
 		self.assertIn('test-job', result.job_id)
 		self.mock_s3.upload_file.assert_called_once()
 
+	def test_should_raise_job_error_and_warn_when_temp_file_cannot_be_deleted(self):
+		self.mock_bedrock.create_model_invocation_job.side_effect = RuntimeError('job rejected')
+
+		with patch('bedrockhelper.main.os.remove', side_effect=PermissionError('locked')):
+			with self.assertLogs('bedrockhelper.main', level='WARNING') as logs:
+				with self.assertRaisesRegex(RuntimeError, 'job rejected'):
+					self.helper.submit_embedding_batch_job(
+						[('id1', 'text1')],
+						s3_bucket='test-bucket',
+						s3_prefix='prefix',
+						role_arn='arn:aws:iam::123456789012:role/test',
+					)
+
+		self.assertIn('Could not delete batch input file', logs.output[0])
+
 	def test_submit_batch_job_no_bucket(self):
 		with self.assertRaises(ValueError) as ctx:
 			self.helper.submit_embedding_batch_job(
@@ -1024,3 +1102,126 @@ class TestCallWithRefresh(TestCase):
 		self.assertEqual(result, 'success')
 		mock_invalidate.assert_called_once()
 		self.assertEqual(mock_fn.call_count, 2)
+
+
+class TestAsyncStreamWithRAG(IsolatedAsyncioTestCase):
+	def _helper(self, runtime, **kwargs):
+		return BedrockHelper(bedrock_runtime_client=runtime, bedrock_client=Mock(), s3_client=Mock(), **kwargs)
+
+	async def test_streams_text_then_resolves_final_metrics(self):
+		runtime = Mock()
+		runtime.converse_stream.return_value = {
+			'stream': iter(CONVERSE_EVENTS),
+			'ResponseMetadata': {'HTTPHeaders': {'x-amzn-requestid': 'req-1'}},
+		}
+
+		chunks, header_metrics, result_future = await self._helper(runtime).async_stream_with_rag(
+			system_prompt='prompt', context='context'
+		)
+		texts = [t async for t in chunks]
+		result = await asyncio.wait_for(result_future, timeout=5)
+
+		self.assertEqual(texts, ['Hello', ' world'])
+		self.assertEqual(header_metrics.header_metrics, {'x-amzn-requestid': 'req-1'})
+		self.assertEqual(result.text, 'Hello world')
+		self.assertEqual((result.metrics.input_tokens, result.metrics.output_tokens), (12, 3))
+
+	async def test_error_before_streaming_is_raised_from_the_call(self):
+		runtime = Mock()
+		runtime.converse_stream.side_effect = ClientError(
+			{'Error': {'Code': 'AccessDeniedException', 'Message': 'no'}}, 'ConverseStream'
+		)
+
+		with self.assertRaises(ClientError):
+			await asyncio.wait_for(
+				self._helper(runtime).async_stream_with_rag(system_prompt='prompt', context='context'), timeout=5
+			)
+
+	async def test_error_mid_stream_is_raised_from_the_iterator(self):
+		def events():
+			yield CONVERSE_EVENTS[1]
+			raise RuntimeError('connection reset')
+
+		runtime = Mock()
+		runtime.converse_stream.return_value = {'stream': events()}
+
+		chunks, _, result_future = await self._helper(runtime).async_stream_with_rag(
+			system_prompt='prompt', context='context'
+		)
+		received = []
+		with self.assertRaisesRegex(RuntimeError, 'connection reset'):
+			async for t in chunks:
+				received.append(t)
+
+		self.assertEqual(received, ['Hello'])
+		with self.assertRaisesRegex(RuntimeError, 'connection reset'):
+			await asyncio.wait_for(result_future, timeout=5)
+
+	async def test_failed_streams_release_their_concurrency_slot(self):
+		runtime = Mock()
+		runtime.converse_stream.side_effect = ClientError(
+			{'Error': {'Code': 'ThrottlingException', 'Message': 'slow down'}}, 'ConverseStream'
+		)
+		helper = self._helper(runtime, max_concurrent_streams=1)
+
+		for _ in range(3):
+			with self.assertRaises(ClientError):
+				await asyncio.wait_for(helper.async_stream_with_rag(system_prompt='p', context='c'), timeout=5)
+
+	async def _worker_finished(self, helper):
+		# With max_concurrent_streams=1, the slot frees only once the worker has
+		# queued its last callback; two loop turns then run those callbacks.
+		self.assertTrue(await asyncio.to_thread(helper._stream_sema.acquire, timeout=5))
+		helper._stream_sema.release()
+		await asyncio.sleep(0)
+		await asyncio.sleep(0)
+
+	def _record_loop_errors(self):
+		errors = []
+		asyncio.get_running_loop().set_exception_handler(lambda loop, ctx: errors.append(ctx.get('exception')))
+		return errors
+
+	async def test_should_not_raise_on_loop_when_result_future_is_cancelled_mid_stream(self):
+		errors = self._record_loop_errors()
+		release = threading.Event()
+
+		def events():
+			yield CONVERSE_EVENTS[1]
+			release.wait(5)
+			yield from CONVERSE_EVENTS[2:]
+
+		runtime = Mock()
+		runtime.converse_stream.return_value = {'stream': events()}
+		helper = self._helper(runtime, max_concurrent_streams=1)
+
+		chunks, _, result_future = await helper.async_stream_with_rag(system_prompt='p', context='c')
+		result_future.cancel()
+		release.set()
+		self.assertEqual([t async for t in chunks], ['Hello', ' world'])
+		await self._worker_finished(helper)
+
+		self.assertEqual(errors, [])
+
+	async def test_should_not_raise_on_loop_when_the_call_is_cancelled_before_headers(self):
+		errors = self._record_loop_errors()
+		started = threading.Event()
+		release = threading.Event()
+
+		def converse_stream(**_):
+			started.set()
+			release.wait(5)
+			return {'stream': iter(CONVERSE_EVENTS)}
+
+		runtime = Mock()
+		runtime.converse_stream.side_effect = converse_stream
+		helper = self._helper(runtime, max_concurrent_streams=1)
+
+		call = asyncio.create_task(helper.async_stream_with_rag(system_prompt='p', context='c'))
+		self.assertTrue(await asyncio.to_thread(started.wait, 5))
+		call.cancel()
+		release.set()
+		with self.assertRaises(asyncio.CancelledError):
+			await call
+		await self._worker_finished(helper)
+
+		self.assertEqual(errors, [])

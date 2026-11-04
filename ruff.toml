@@ -36,10 +36,11 @@ indent-width = 4
 target-version = "py311"
 
 [lint]
-select = ["E4", "E7", "E9", "F"]
+# UP: one annotation style (builtin generics, `X | None`) for the target Python.
+# PLC0415: imports belong at the top of the module, never inside a function.
+select = ["E4", "E7", "E9", "F", "UP", "PLC0415"]
 ignore = [
     'E401', # multiple imports on one line
-    'E402', # module level import not at top of file
     #    'E501', # line too long (82 > 79 characters)
     'F403', # 'from module import *' used; unable to detect undefined names
 ]
