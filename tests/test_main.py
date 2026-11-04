@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import threading
 from datetime import datetime, timedelta, UTC
 from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import Mock, patch
@@ -1110,3 +1111,61 @@ class TestAsyncStreamWithRAG(IsolatedAsyncioTestCase):
 		for _ in range(3):
 			with self.assertRaises(ClientError):
 				await asyncio.wait_for(helper.async_stream_with_rag(system_prompt='p', context='c'), timeout=5)
+
+	async def _worker_finished(self, helper):
+		# With max_concurrent_streams=1, the slot frees only once the worker has
+		# queued its last callback; two loop turns then run those callbacks.
+		self.assertTrue(await asyncio.to_thread(helper._stream_sema.acquire, timeout=5))
+		helper._stream_sema.release()
+		await asyncio.sleep(0)
+		await asyncio.sleep(0)
+
+	def _record_loop_errors(self):
+		errors = []
+		asyncio.get_running_loop().set_exception_handler(lambda loop, ctx: errors.append(ctx.get('exception')))
+		return errors
+
+	async def test_should_not_raise_on_loop_when_result_future_is_cancelled_mid_stream(self):
+		errors = self._record_loop_errors()
+		release = threading.Event()
+
+		def events():
+			yield CONVERSE_EVENTS[1]
+			release.wait(5)
+			yield from CONVERSE_EVENTS[2:]
+
+		runtime = Mock()
+		runtime.converse_stream.return_value = {'stream': events()}
+		helper = self._helper(runtime, max_concurrent_streams=1)
+
+		chunks, _, result_future = await helper.async_stream_with_rag(system_prompt='p', context='c')
+		result_future.cancel()
+		release.set()
+		self.assertEqual([t async for t in chunks], ['Hello', ' world'])
+		await self._worker_finished(helper)
+
+		self.assertEqual(errors, [])
+
+	async def test_should_not_raise_on_loop_when_the_call_is_cancelled_before_headers(self):
+		errors = self._record_loop_errors()
+		started = threading.Event()
+		release = threading.Event()
+
+		def converse_stream(**_):
+			started.set()
+			release.wait(5)
+			return {'stream': iter(CONVERSE_EVENTS)}
+
+		runtime = Mock()
+		runtime.converse_stream.side_effect = converse_stream
+		helper = self._helper(runtime, max_concurrent_streams=1)
+
+		call = asyncio.create_task(helper.async_stream_with_rag(system_prompt='p', context='c'))
+		self.assertTrue(await asyncio.to_thread(started.wait, 5))
+		call.cancel()
+		release.set()
+		with self.assertRaises(asyncio.CancelledError):
+			await call
+		await self._worker_finished(helper)
+
+		self.assertEqual(errors, [])

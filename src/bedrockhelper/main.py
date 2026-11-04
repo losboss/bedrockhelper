@@ -16,6 +16,7 @@ generation (RAG) and for producing vector embeddings.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -66,6 +67,21 @@ def _to_int(value: Any, default: int | None = None) -> int | None:
 		return int(value)
 	except (TypeError, ValueError):
 		return default
+
+
+def _settle(future: asyncio.Future[_T], *, result: _T | None = None, error: BaseException | None = None) -> None:
+	"""
+	Complete `future` unless the caller already cancelled it.
+
+	Scheduled with call_soon_threadsafe, so the done() check runs on the event
+	loop: checking from the worker thread could race with a cancellation.
+	"""
+	if future.done():
+		return
+	if error is not None:
+		future.set_exception(error)
+	else:
+		future.set_result(result)  # type: ignore[arg-type]
 
 
 class BedrockHelper:
@@ -524,19 +540,19 @@ class BedrockHelper:
 				# BaseException: whatever escapes here would leave the caller
 				# awaiting header_future forever.
 				except BaseException as e:
-					loop.call_soon_threadsafe(header_future.set_exception, e)
+					loop.call_soon_threadsafe(functools.partial(_settle, header_future, error=e))
 					return
-				loop.call_soon_threadsafe(header_future.set_result, stream.header_metrics)
+				loop.call_soon_threadsafe(functools.partial(_settle, header_future, result=stream.header_metrics))
 				try:
 					for t in stream:
 						loop.call_soon_threadsafe(q.put_nowait, t)
 				# BaseException, as above: it is handed to the caller's iterator and
 				# result_future, and an escape would leave the iterator waiting forever.
 				except BaseException as e:
-					loop.call_soon_threadsafe(result_future.set_exception, e)
+					loop.call_soon_threadsafe(functools.partial(_settle, result_future, error=e))
 					loop.call_soon_threadsafe(q.put_nowait, e)
 					return
-				loop.call_soon_threadsafe(result_future.set_result, stream.result)
+				loop.call_soon_threadsafe(functools.partial(_settle, result_future, result=stream.result))
 				loop.call_soon_threadsafe(q.put_nowait, None)
 
 		threading.Thread(target=worker, daemon=True).start()

@@ -11,6 +11,7 @@ import contextlib
 import inspect
 import io
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ from unittest import TestCase
 from unittest.mock import patch
 
 import boto3
+from botocore.session import Session as BotocoreSession
 from botocore.validate import validate_parameters
 from stream_events import CONVERSE_EVENTS
 
@@ -31,8 +33,14 @@ class FakeClient:
 	"""Answers like a boto3 client, validating each call against the real service model."""
 
 	def __init__(self, service: str, responses: dict[str, Any]) -> None:
-		# Building a client reads the bundled service model; it makes no request.
-		self._real = boto3.client(service, region_name='ca-central-1')
+		# Only the bundled service model is needed. Explicit dummy keys stop boto3
+		# looking up real credentials, which can reach the EC2 metadata endpoint.
+		self._real = boto3.client(
+			service,
+			region_name='ca-central-1',
+			aws_access_key_id='testing',
+			aws_secret_access_key='testing',
+		)
 		self._responses = responses
 
 	def __getattr__(self, name: str) -> Any:
@@ -123,3 +131,9 @@ class TestReadmeExamples(TestCase):
 		self.assertIn('Hello world3', printed)  # streamed text, then the end-of-stream token count
 		self.assertIn('Completed', printed)
 		self.assertIn('Got 2 embeddings for arn:aws:bedrock', printed)
+
+	def test_should_build_validation_clients_without_looking_up_credentials(self):
+		# Credential lookup ends at the EC2 metadata endpoint, which an offline test must not reach.
+		with patch.dict(os.environ, {}, clear=True):
+			with patch.object(BotocoreSession, 'get_credentials', side_effect=AssertionError('credentials looked up')):
+				fake_clients()
