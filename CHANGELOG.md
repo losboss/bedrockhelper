@@ -1,5 +1,16 @@
 # Changelog
 
+## [2.0.0](https://github.com/losboss/bedrockhelper/compare/bedrockhelper-v1.2.2...bedrockhelper-v2.0.0) (2026-11-04)
+
+
+### ⚠ BREAKING CHANGES
+
+* Converse errors are raised instead of being retried through invoke_model. Removed utils.iter_bedrock_stream_text and utils.iter_bedrock_stream_text_gen_with_tail; main._BotoSessionManager is now session.BotoSessionManager; RAGStream's build_final takes only the full text.
+
+### Bug Fixes
+
+* raise Bedrock errors, report streaming token counts, correct README ([#66](https://github.com/losboss/bedrockhelper/issues/66)) ([9bd7ec1](https://github.com/losboss/bedrockhelper/commit/9bd7ec19d65722a7319e828bb5ba023777d0a284))
+
 ## [1.2.2](https://github.com/losboss/bedrockhelper/compare/bedrockhelper-v1.2.1...bedrockhelper-v1.2.2) (2026-11-03)
 
 
